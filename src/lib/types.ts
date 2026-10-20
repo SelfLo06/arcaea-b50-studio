@@ -1,0 +1,136 @@
+export interface LocalizedTitle {
+  en?: string;
+  ja?: string;
+  zh?: string;
+  [key: string]: string | undefined;
+}
+
+export interface Best50Score {
+  difficultyAlias?: number;
+  songId: string;
+  difficulty: number;
+  modifier: number;
+  rating: number;
+  score: number;
+  perfectCount: number;
+  nearCount: number;
+  missCount: number;
+  clearType: number;
+  title: LocalizedTitle;
+  artist: string;
+  timePlayed: number;
+  bg?: string;
+  imageKey?: string;
+  imageUrl?: string;
+}
+
+export interface StoredUser {
+  rating: number;
+  name?: string;
+  userCode?: string;
+  country?: string;
+  joinDate?: number;
+  characterId?: number;
+  characterIcon?: string;
+  avatarImageKey?: string;
+  avatarImageUrl?: string;
+}
+
+export interface ImageStats {
+  requested: number;
+  uploaded: number;
+  failed: number;
+  failures: Array<{ songId: string; reason: string }>;
+  cached?: number;
+}
+
+export type MediaStatus = "processing" | "complete" | "failed";
+
+export interface ChartImageCacheEntry {
+  songId: string;
+  bg?: string;
+  imageKey?: string;
+  imageUrl?: string;
+  updatedAt: string;
+}
+
+export interface CharacterImageCacheEntry {
+  characterId: number;
+  icon?: string;
+  imageKey?: string;
+  imageUrl?: string;
+  updatedAt: string;
+}
+
+export interface B50Snapshot {
+  id: string;
+  fetchedAt: string;
+  trigger: "manual" | "daily" | "cron";
+  potential: number;
+  weightedPotential: number;
+  user: StoredUser;
+  best50: Best50Score[];
+  potentialImageKey?: string;
+  potentialImageUrl?: string;
+  imageStats: ImageStats;
+  mediaStatus?: MediaStatus;
+  mediaError?: string;
+}
+
+export interface PotentialHistoryPoint {
+  source?: "lowiro";
+  date: string;
+  potential: number;
+  snapshotId: string;
+  fetchedAt: string;
+}
+
+export interface DashboardPayload {
+  latest: B50Snapshot | null;
+  history: PotentialHistoryPoint[];
+  activeJob: JobView | null;
+  scheduler: {
+    timezone: string;
+    cron: string;
+  };
+}
+
+export interface HistoryPayload {
+  snapshots: B50Snapshot[];
+  sources: {
+    d1Count: number;
+    r2Count: number;
+    r2Available: boolean;
+  };
+}
+
+export type JobKind = "sync" | "import" | "retry";
+export interface JobView {
+  id: string;
+  kind: JobKind;
+  status: "queued" | "running" | "succeeded" | "failed";
+  stage: string;
+  progress: { completed: number; total: number };
+  createdAt: string;
+  updatedAt: string;
+  result?: { snapshot?: B50Snapshot; recorded?: boolean; duplicateOf?: string; message: string };
+  error?: string;
+}
+
+export type LogScope = "b50" | "media";
+export type LogLevel = "info" | "success" | "warning" | "error";
+
+export interface LogEntry {
+  id: string;
+  timestamp: string;
+  scope: LogScope;
+  level: LogLevel;
+  action: string;
+  message: string;
+  snapshotId?: string;
+  details?: Record<string, string | number | boolean>;
+}
+
+export interface LogsPayload {
+  entries: LogEntry[];
+}

@@ -1,0 +1,4 @@
+# Local development: copy to .dev.vars. Deploy button: prompts for these secrets.
+ADMIN_TOKEN=replace-with-a-long-random-token
+USERNAME=your-account-email
+PASSWD=your-password

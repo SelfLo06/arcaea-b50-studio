@@ -1,0 +1,75 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "arcaea-b50-studio",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-15",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist"
+  },
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "redact_query_string": true
+  },
+  "ratelimits": [
+    {
+      "name": "LOGIN_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 20,
+        "period": 10
+      }
+    }
+  ],
+  "vars": {
+    "SCHEDULE_TIMEZONE": "Asia/Shanghai",
+    "DAILY_SYNC_ENABLED": "false",
+    "MUTATIONS_ENABLED": "true"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "arcaea-b50-studio",
+      "database_id": "bcebb4bc-030f-4eae-98ab-f9ad82cd8a6c",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "arcaea-assets","preview_bucket_name": "arcaea-assets"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "JOBS",
+        "queue": "arcaea-jobs"
+      },
+      {
+        "binding": "FAILED_JOBS",
+        "queue": "arcaea-jobs-failed"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "arcaea-jobs",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_concurrency": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "arconline-ext-jobs-failed"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": [
+      "59 15 * * *",
+      "*/5 * * * *"
+    ]
+  }
+}
