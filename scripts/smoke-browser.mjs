@@ -8,6 +8,14 @@ await mkdir(artifactDirectory,{recursive:true});
 const browser=await chromium.launch({headless:true});
 try {
  const context=await browser.newContext();const page=await context.newPage();const errors=[];
+ const exportAssets=[];
+ let exportProfileRequests=0;
+ page.on('request',request=>{
+  if(/score-result-renderer|result-(text|score|cjk|number).*woff2|ui-pack.*json|\/api\/score-export\/profile/.test(request.url()))exportAssets.push(request.url());
+  if(request.url().includes('/api/score-export/profile'))exportProfileRequests++;
+ });
+ // Local D1 fixtures can reference covers that are only present in production R2.
+ await page.route('**/api/media/charts/**',route=>route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"><path fill="#6255b8" d="M0 0h512v512H0z"/></svg>'}));
  page.on('pageerror',error=>errors.push(error.message));
  async function signIn() {
   await page.locator('astro-island:not([ssr])').waitFor();
@@ -22,8 +30,13 @@ try {
  const loginMark=await page.locator('.auth-topbar .brand-mark').evaluate(element=>{const style=getComputedStyle(element);return{box:element.getBoundingClientRect().width,paths:element.querySelectorAll('path').length,circles:element.querySelectorAll('circle').length,background:style.backgroundColor,clipPath:style.clipPath}});
  if(loginMark.box<30||loginMark.paths<4||loginMark.circles<2||loginMark.background!=='rgba(0, 0, 0, 0)'||loginMark.clipPath!=='none')throw new Error(`Brand mark failed to render: ${JSON.stringify(loginMark)}`);
  await signIn();
+ await page.locator('astro-island:not([ssr])').waitFor();
  await page.locator('.score-grid .score-card').first().waitFor({timeout:30000});
  const cards=await page.locator('.score-grid .score-card').count();if(cards!==50)throw new Error(`Expected 50 scores, got ${cards}`);
+ await page.locator('astro-island:has(.score-card):not([ssr])').waitFor();
+ await expect(page.locator('#b50 .score-export-button')).toHaveCount(50);
+ await expect(page.locator('#b50 .score-song-id')).toHaveCount(0);
+ expect(exportAssets).toEqual([]);
  const footerText=await page.locator('.footer').innerText();
  if(footerText!=='ArcOnline Extension')throw new Error(`Footer should only show the product name: ${JSON.stringify(footerText)}`);
  if(await page.title()!=='ArcOnline Extension')throw new Error(`Unexpected page title: ${await page.title()}`);
@@ -53,6 +66,125 @@ try {
  const sidebarTop=await page.locator('.topbar').evaluate(element=>element.getBoundingClientRect().top);
  if(Math.abs(sidebarTop)>1)throw new Error(`Sidebar did not remain sticky while scrolling (top ${sidebarTop}px)`);
  await page.evaluate(()=>scrollTo(0,0));
+
+ const baselineResponse=await context.request.get(origin+'/api/dashboard');
+ expect(baselineResponse.ok()).toBe(true);
+ const baseline=await baselineResponse.json();
+ expect(baseline.activeJob).toBeNull();
+ let failExportProfile=false;
+ await page.route('**/api/score-export/profile',route=>{
+  expect(route.request().method()).toBe('POST');
+  return failExportProfile
+   ?route.fulfill({status:502,json:{error:'用户信息暂时不可用，请重试导出。'}})
+   :route.fulfill({json:{characterAssetId:'23u',user:{...baseline.user,name:'B50 Export Test',rating:12.939,characterId:23}}});
+ });
+ await page.evaluate(()=>{
+  window.__exportText=[];
+  const original=CanvasRenderingContext2D.prototype.fillText;
+  CanvasRenderingContext2D.prototype.fillText=function(value,...args){window.__exportText.push(value);return original.call(this,value,...args);};
+ });
+ async function exportOverview(name){
+  const card=page.locator('#b50 .score-card').first();
+  const downloadEvent=page.waitForEvent('download',{timeout:60000});
+  await card.getByRole('button',{name:'导出',exact:true}).click();
+  const download=await downloadEvent;
+  await download.saveAs(`${artifactDirectory}/overview-result-${name}.png`);
+  const bytes=await readFile(`${artifactDirectory}/overview-result-${name}.png`);
+  expect(bytes.subarray(0,8).toString('hex')).toBe('89504e470d0a1a0a');
+  expect([bytes.readUInt32BE(16),bytes.readUInt32BE(20)]).toEqual([3124,1440]);
+  await expect(card.getByRole('button',{name:'导出',exact:true})).toBeEnabled();
+  await expect(card.getByRole('alert')).toHaveCount(0);
+ }
+ const packResponse=page.waitForResponse(response=>response.request().resourceType()==='fetch'&&response.url().includes('ui-pack'));
+ await page.locator('#b50 .score-export-button').first().hover();
+ expect((await packResponse).ok()).toBe(true);
+ await expect.poll(()=>page.evaluate(()=>[...document.fonts].filter(font=>font.family.includes('Arcaea Result')&&font.status==='loaded').length)).toBe(6);
+ expect(exportProfileRequests).toBe(0);
+ await exportOverview('desktop');
+ expect(exportProfileRequests).toBe(1);
+ await expect(page.locator('.profile-copy h2')).toHaveText('B50 Export Test');
+ await expect(page.locator('.profile-potential strong')).toHaveText('12.939');
+ await expect(page.locator('#b50 .score-card')).toHaveCount(50);
+ const firstScore=baseline.latest.best50[0];
+ const firstCard=page.locator('#b50 .score-card').first();
+ const bonus=await firstCard.locator('.score-count-bonus').textContent();
+ expect(await page.evaluate(()=>window.__exportText)).toEqual(expect.arrayContaining([
+  String(firstScore.score).padStart(8,'0').replace(/\B(?=(\d{3})+(?!\d))/g,"'"),
+  firstScore.rating.toFixed(3),await firstCard.locator('.score-potential strong').textContent(),
+  bonus.replaceAll(',',''),'B50 Export Test',
+ ]));
+ expect((await page.evaluate(()=>window.__exportText)).join(' ')).not.toMatch(/undefined|NaN/);
+ await page.screenshot({path:`${artifactDirectory}/overview-export-desktop.png`});
+ await page.getByRole('tab',{name:'1W',exact:true}).click();
+ await expect(page.getByRole('tab',{name:'1W',exact:true})).toHaveAttribute('aria-selected','true');
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+ // Changing the chart or job progress must not reformat 50 unchanged cards.
+ await page.evaluate(times=>{
+  const playedAt=new Set(times), original=Intl.DateTimeFormat.prototype.formatToParts;
+  window.__scoreFormattingCount=0;
+  window.__restoreScoreFormatting=()=>{Intl.DateTimeFormat.prototype.formatToParts=original};
+  Intl.DateTimeFormat.prototype.formatToParts=function(value){
+   if(playedAt.has(Number(value)))window.__scoreFormattingCount++;
+   return original.call(this,value);
+  };
+ },baseline.latest.best50.map(score=>score.timePlayed).filter(time=>time>0));
+ await page.getByRole('tab',{name:'5Y',exact:true}).click();
+ await expect(page.getByRole('tab',{name:'5Y',exact:true})).toHaveAttribute('aria-selected','true');
+ if(await page.getByRole('button',{name:'放大',exact:true}).isEnabled()){
+  await page.getByRole('button',{name:'放大',exact:true}).click();
+  await expect(page.getByRole('button',{name:'查看全部',exact:true})).toBeEnabled();
+  await page.getByRole('button',{name:'查看全部',exact:true}).click();
+  await expect(page.getByRole('button',{name:'查看全部',exact:true})).toBeDisabled();
+ }
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+ expect(await page.evaluate(()=>window.__scoreFormattingCount)).toBe(0);
+
+ const jobId='00000000-0000-4000-8000-000000000001';
+ const syncUrl=origin+'/api/sync', jobUrl=origin+`/api/jobs/${jobId}`, dashboardUrl=origin+'/api/dashboard';
+ const refreshed=structuredClone(baseline);
+ refreshed.latest.best50[0].score++;
+ let jobReads=0, dashboardReads=0, terminalJobReads=0, finishJob=false, submitReads=0;
+ let releaseSubmission;
+ const submissionGate=new Promise(resolve=>{releaseSubmission=resolve});
+ // These routes keep the smoke test from submitting a real synchronization job.
+ await page.route(syncUrl,async route=>{
+  submitReads++;
+  await submissionGate;
+  await route.fulfill({status:202,json:{jobId,status:'queued'}});
+ });
+ await page.route(jobUrl,route=>{
+  jobReads++;
+  if(finishJob)terminalJobReads++;
+  return route.fulfill({json:{id:jobId,kind:'sync',status:finishJob?'succeeded':'running',stage:finishJob?'done':'media',progress:{completed:finishJob?51:jobReads,total:51},createdAt:'',updatedAt:'',...(finishJob?{result:{snapshot:refreshed.latest,message:'浏览器同步测试完成'}}:{})}});
+ });
+ await page.route(dashboardUrl,route=>{
+  dashboardReads++;
+  return dashboardReads===1
+   ?route.fulfill({status:503,json:{error:'Temporary dashboard failure'}})
+   :route.fulfill({json:refreshed});
+ });
+ await page.getByRole('button',{name:'获取 B50 & 潜力图',exact:true}).click();
+ await expect(page.locator('.job-status')).toContainText('正在提交任务…');
+ await expect(page.getByRole('button',{name:'正在提交…',exact:true})).toBeDisabled();
+ await expect.poll(()=>submitReads).toBe(1);
+ expect(jobReads).toBe(0);
+ expect(dashboardReads).toBe(0);
+ expect(await page.evaluate(()=>window.__scoreFormattingCount)).toBe(0);
+ releaseSubmission();
+ await expect.poll(()=>jobReads,{timeout:10000}).toBeGreaterThanOrEqual(2);
+ expect(dashboardReads).toBe(0);
+ expect(await page.evaluate(()=>window.__scoreFormattingCount)).toBe(0);
+ finishJob=true;
+ await expect(page.locator('.job-status')).toContainText('暂时无法刷新概览',{timeout:10000});
+ await expect(page.getByRole('dialog')).toContainText('浏览器同步测试完成',{timeout:10000});
+ expect(dashboardReads).toBe(2);
+ expect(terminalJobReads).toBe(1);
+ await page.getByRole('button',{name:'关闭',exact:true}).click();
+ await expect(page.locator('.score-number strong').first()).toHaveText(new Intl.NumberFormat('en-US').format(refreshed.latest.best50[0].score));
+ expect(await page.evaluate(()=>window.__scoreFormattingCount)).toBeGreaterThan(0);
+ await page.evaluate(()=>window.__restoreScoreFormatting());
+ await page.unroute(syncUrl);await page.unroute(jobUrl);await page.unroute(dashboardUrl);
+
  await page.getByRole('link',{name:'历史',exact:true}).click();await page.waitForURL('**/history');
  await page.locator('astro-island:not([ssr])').waitFor();
  const historyKickerGap=await page.locator('.history-intro .section-kicker').evaluate(kicker=>{const title=kicker.parentElement.querySelector('h1');return title.getBoundingClientRect().top-kicker.getBoundingClientRect().bottom});
@@ -74,6 +206,17 @@ try {
  await signIn();
  await page.locator('.score-grid .score-card').first().waitFor();await page.screenshot({path:`${artifactDirectory}/dashboard-mobile.png`,fullPage:true});
  const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth);if(overflow)throw new Error('Mobile horizontal overflow');
+ await page.setViewportSize({width:320,height:900});
+ await page.locator('astro-island:has(.score-card):not([ssr])').waitFor();
+ failExportProfile=true;
+ await page.locator('#b50 .score-export-button').first().click();
+ await expect(page.locator('#b50 .score-card').first().getByRole('alert')).toContainText('用户信息暂时不可用');
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
+ failExportProfile=false;
+ await exportOverview('mobile');
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth)).toBe(false);
+ await page.locator('#b50 .score-card').first().scrollIntoViewIfNeeded();
+ await page.screenshot({path:`${artifactDirectory}/overview-export-mobile.png`});
  if(errors.length)throw new Error(errors.join('\n'));
- console.log(JSON.stringify({origin,cards,login:true,historyComparison:true,logout:true,mobile:true,pageErrors:errors.length}));
+ console.log(JSON.stringify({origin,cards,login:true,historyComparison:true,logout:true,mobile:true,export:{png:'3124x1440',b50:true,lazyAssets:true,shinyPure:true,ptt:true,retry:true,responsive:320},cardMemoization:true,polling:{jobReads,dashboardReads,terminalJobReads},pageErrors:errors.length}));
 } finally {await browser.close();}

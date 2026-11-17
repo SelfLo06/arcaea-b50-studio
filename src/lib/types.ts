@@ -5,12 +5,11 @@ export interface LocalizedTitle {
   [key: string]: string | undefined;
 }
 
-export interface Best50Score {
+export interface Score {
   difficultyAlias?: number;
   songId: string;
   difficulty: number;
   modifier: number;
-  rating: number;
   score: number;
   perfectCount: number;
   nearCount: number;
@@ -24,6 +23,29 @@ export interface Best50Score {
   imageUrl?: string;
 }
 
+export interface Best50Score extends Score {
+  rating: number;
+}
+
+export interface SongScore extends Score {
+  shinyPerfectCount: number;
+  bestClearType: number;
+  yearlyPlayCount: number;
+}
+
+export interface SongScoreQuery {
+  term: string;
+  difficulty: number;
+  page: number;
+  sort: "date" | "score" | "score_below_max" | "title";
+}
+
+export interface SongScoresPayload {
+  scores: SongScore[];
+  count: number;
+  exportHint?: ScoreExportHint;
+}
+
 export interface StoredUser {
   rating: number;
   name?: string;
@@ -32,9 +54,22 @@ export interface StoredUser {
   joinDate?: number;
   characterId?: number;
   characterIcon?: string;
+  characterUncapped?: boolean;
+  characterUncappedOverride?: boolean;
   avatarImageKey?: string;
   avatarImageUrl?: string;
+  bannerId?: string;
+  bannerResource?: string;
+  bannerImageKey?: string;
 }
+
+export interface ScoreExportProfile {
+  user: StoredUser;
+  characterAssetId: string;
+  bannerImageUrl?: string;
+}
+
+export type ScoreExportHint = Pick<StoredUser, "rating" | "characterId" | "characterUncapped" | "characterUncappedOverride" | "bannerResource">;
 
 export interface ImageStats {
   requested: number;
@@ -86,17 +121,39 @@ export interface PotentialHistoryPoint {
 }
 
 export interface DashboardPayload {
+  user: StoredUser | null;
   latest: B50Snapshot | null;
   history: PotentialHistoryPoint[];
   activeJob: JobView | null;
+  version?: GameVersionStatus;
   scheduler: {
     timezone: string;
     cron: string;
   };
 }
 
+export interface GameVersionStatus {
+  constantsVersion: string;
+  latestVersion: string | null;
+  upToDate: boolean | null;
+  checkedAt: string | null;
+  source: "lowiro-apk";
+  error?: string;
+}
+
+export interface SnapshotSummary {
+  id: string;
+  fetchedAt: string;
+  potential: number;
+  weightedPotential: number;
+  trigger: B50Snapshot["trigger"];
+  mediaStatus?: MediaStatus;
+  entries: number;
+}
+
 export interface HistoryPayload {
-  snapshots: B50Snapshot[];
+  snapshots: SnapshotSummary[];
+  detail: B50Snapshot | null;
   sources: {
     d1Count: number;
     r2Count: number;
@@ -113,6 +170,7 @@ export interface JobView {
   progress: { completed: number; total: number };
   createdAt: string;
   updatedAt: string;
+  timings?: import("./profiling").TimingSpan[];
   result?: { snapshot?: B50Snapshot; recorded?: boolean; duplicateOf?: string; message: string };
   error?: string;
 }

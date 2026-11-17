@@ -1,7 +1,10 @@
 import type { Env } from "./environment";
 import { AppError } from "./errors";
 
-const TTL = 3600;
+// Every media key is write-once: charts/, characters/ and banners/ are addressed by
+// Lowiro content hashes and potential/ by unique snapshot id, so retries only
+// re-upload identical bytes and caches may hold them for a year.
+const TTL = 31536000;
 type Background = Pick<ExecutionContext, "waitUntil">;
 
 // Call only after authenticating the request. Cached bytes are shared internally;
@@ -12,7 +15,7 @@ export async function serveMedia(env: Env, request: Request, background?: Backgr
   let key: string;
   try { key = decodeURIComponent(new URL(request.url).pathname.slice("/api/media/".length)); }
   catch { throw new AppError("无效的媒体路径。", 400, "INVALID_ASSET_KEY"); }
-  if (!key || key.includes("..") || key.startsWith("/") || key.includes("\\") || !/^(charts|characters|potential)\//.test(key))
+  if (!key || key.includes("..") || key.startsWith("/") || key.includes("\\") || !/^(charts|characters|potential|banners)\//.test(key))
     throw new AppError("无效的媒体路径。", 400, "INVALID_ASSET_KEY");
 
   const url = new URL(request.url);
@@ -35,7 +38,7 @@ export async function serveMedia(env: Env, request: Request, background?: Backgr
       "content-length": String(object.size),
       etag: object.httpEtag,
       "last-modified": object.uploaded.toUTCString(),
-      "cache-control": `public, max-age=${TTL}`,
+      "cache-control": `public, max-age=${TTL}, immutable`,
     } });
     if (cache && request.method === "GET") {
       const write = cache.put(cacheKey, response.clone()).catch(() => {
@@ -47,7 +50,7 @@ export async function serveMedia(env: Env, request: Request, background?: Backgr
   }
 
   const headers = new Headers(response.headers);
-  headers.set("cache-control", `private, max-age=${TTL}`);
+  headers.set("cache-control", `private, max-age=${TTL}, immutable`);
   headers.set("cdn-cache-control", "no-store");
   headers.set("vary", "Cookie");
   headers.set("x-content-type-options", "nosniff");

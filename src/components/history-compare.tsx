@@ -1,8 +1,10 @@
 "use client";
 
 import * as React from "react";
-import type { B50Snapshot } from "@/lib/types";
+import type { SnapshotSummary } from "@/lib/types";
 import { compareSnapshots, type ComparedField } from "@/lib/history-diff";
+import { cachedSnapshot, loadSnapshot } from "@/lib/snapshot-cache";
+import { exactWeightedPotential } from "@/lib/potential";
 import { clearTypeLabel, difficultyLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
@@ -27,27 +29,48 @@ function fieldValue(field: ComparedField, value: number) {
   return value.toLocaleString("en-US");
 }
 
-export function HistoryCompare({ snapshots }: { snapshots: B50Snapshot[] }) {
-  const [beforeId, setBeforeId] = React.useState(snapshots[1]?.id || snapshots[0]?.id || "");
-  const [afterId, setAfterId] = React.useState(snapshots[0]?.id || "");
+// Full snapshots load on demand through the shared cache (snapshot-cache.ts),
+// so comparisons reuse whatever the detail view already fetched.
+export function HistoryCompare({ summaries }: { summaries: SnapshotSummary[] }) {
+  const [beforeId, setBeforeId] = React.useState(summaries[1]?.id || summaries[0]?.id || "");
+  const [afterId, setAfterId] = React.useState(summaries[0]?.id || "");
   const [showUnchanged, setShowUnchanged] = React.useState(false);
-  const before = snapshots.find((item) => item.id === beforeId);
-  const after = snapshots.find((item) => item.id === afterId);
+  const [failedIds, setFailedIds] = React.useState<string[]>([]);
+  const [, bump] = React.useReducer((count: number) => count + 1, 0);
+
+  React.useEffect(() => {
+    let active = true;
+    for (const id of [beforeId, afterId].filter(id => id && !cachedSnapshot(id))) {
+      loadSnapshot(id)
+        .then(() => { if (active) bump(); })
+        .catch(() => {
+          if (active) setFailedIds(prev => prev.includes(id) ? prev : [...prev, id]);
+        });
+    }
+    return () => { active = false; };
+  }, [beforeId, afterId]);
+
+  const before = cachedSnapshot(beforeId);
+  const after = cachedSnapshot(afterId);
   const rows = React.useMemo(() => before && after ? compareSnapshots(before, after) : [], [before, after]);
-  if (snapshots.length < 2) return <section className="history-compare"><h2>历史对比</h2><p>至少需要两次历史记录才能对比。</p></section>;
+  if (summaries.length < 2) return <section className="history-compare"><h2>历史对比</h2><p>至少需要两次历史记录才能对比。</p></section>;
   return (
     <section className="history-compare" aria-label="历史对比">
       <h2>历史对比</h2>
       <p>选择基准 A 和目标 B，差值按 B − A 计算；新增和移出仅表示 B50 列表成员变化。时间为北京时间。</p>
       <div className="compare-controls">
-        <label>基准 A<select value={beforeId} onChange={(event) => setBeforeId(event.target.value)}>{snapshots.map((item) => <option key={item.id} value={item.id}>{timestamp(item.fetchedAt)} · {item.potential.toFixed(3)} · {item.id}</option>)}</select></label>
+        <label>基准 A<select value={beforeId} onChange={(event) => setBeforeId(event.target.value)}>{summaries.map((item) => <option key={item.id} value={item.id}>{timestamp(item.fetchedAt)} · {item.potential.toFixed(3)} · {item.id}</option>)}</select></label>
         <Button variant="secondary" size="sm" onClick={() => { setBeforeId(afterId); setAfterId(beforeId); }}>交换 A / B</Button>
-        <label>目标 B<select value={afterId} onChange={(event) => setAfterId(event.target.value)}>{snapshots.map((item) => <option key={item.id} value={item.id}>{timestamp(item.fetchedAt)} · {item.potential.toFixed(3)} · {item.id}</option>)}</select></label>
+        <label>目标 B<select value={afterId} onChange={(event) => setAfterId(event.target.value)}>{summaries.map((item) => <option key={item.id} value={item.id}>{timestamp(item.fetchedAt)} · {item.potential.toFixed(3)} · {item.id}</option>)}</select></label>
       </div>
-      {beforeId === afterId ? <p role="status">请选择两次不同的历史记录。</p> : before && after ? <>
+      {beforeId === afterId ? <p role="status">请选择两次不同的历史记录。</p> : failedIds.includes(beforeId) || failedIds.includes(afterId) ? (
+        <p role="alert">快照加载失败，请稍后重试。</p>
+      ) : !before || !after ? (
+        <p role="status">正在加载</p>
+      ) : <>
         <div className="compare-summary">
           <span>潜力值：{before.potential.toFixed(3)} → {after.potential.toFixed(3)} <strong>({delta(after.potential - before.potential, 3)})</strong></span>
-          <span>加权 PTT：{before.weightedPotential.toFixed(3)} → {after.weightedPotential.toFixed(3)} <strong>({delta(after.weightedPotential - before.weightedPotential, 3)})</strong></span>
+          <span>加权 PTT：{exactWeightedPotential(before.best50).toFixed(6)} → {exactWeightedPotential(after.best50).toFixed(6)} <strong>({delta(exactWeightedPotential(after.best50) - exactWeightedPotential(before.best50), 6)})</strong></span>
           <span>{Object.entries(kinds).map(([kind, label]) => `${label} ${rows.filter((row) => row.kind === kind).length}`).join(" · ")}</span>
         </div>
         <label className="compare-filter"><input type="checkbox" checked={showUnchanged} onChange={(event) => setShowUnchanged(event.target.checked)} />显示未变化的谱面</label>
@@ -62,7 +85,7 @@ export function HistoryCompare({ snapshots }: { snapshots: B50Snapshot[] }) {
             </div>
           </article>;
         })}</div>
-      </> : null}
+      </>}
     </section>
   );
 }

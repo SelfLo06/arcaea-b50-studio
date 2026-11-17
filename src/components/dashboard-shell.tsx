@@ -21,8 +21,10 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { DashboardPayload, JobView } from "@/lib/types";
+import type { DashboardPayload, JobView, StoredUser } from "@/lib/types";
 import { formatJoinDate, formatRelativeDate } from "@/lib/utils";
+import { PLAYER_PROFILE_UPDATED_EVENT, setScoreExportHint } from "@/lib/score-export-client";
+import { VersionCheck } from "@/components/version-check";
 
 type ActionState = "idle" | "syncing" | "retrying" | "importing";
 type ChartRange = (typeof chartRanges)[number]["label"];
@@ -30,6 +32,7 @@ type ChartRange = (typeof chartRanges)[number]["label"];
 const chartRanges = [
   { label: "1W", days: 7 },
   { label: "1M", days: 31 },
+  { label: "3M", days: 93 },
   { label: "1Y", days: 365 },
   { label: "3Y", days: 1095 },
   { label: "5Y", days: 1825 },
@@ -43,22 +46,42 @@ export function DashboardShell({ initialData }: { initialData: DashboardPayload 
   const [lastAction, setLastAction] = React.useState<"sync" | "retry" | "import">("sync");
   const [logOpen, setLogOpen] = React.useState(false);
   const [chartRange, setChartRange] = React.useState<ChartRange>("1Y");
+  const [interactive, setInteractive] = React.useState(false);
+  const submitting = React.useRef(false);
 
   const [jobId, setJobId] = React.useState<string | null>(initialData.activeJob?.id || null);
   const [job, setJob] = React.useState<JobView | null>(initialData.activeJob);
+  const isSubmitting = action !== "idle" && !jobId;
+  const busy = !interactive || action !== "idle" || Boolean(jobId);
   const latest = data.latest;
+  const user = data.user ?? latest?.user;
+  React.useEffect(() => { setInteractive(true); }, []);
+  React.useEffect(() => { setScoreExportHint(user); }, [user]);
+  React.useEffect(() => {
+    const updateProfile = (event: Event) => {
+      const user = (event as CustomEvent<StoredUser>).detail;
+      setData(current => ({ ...current, user }));
+    };
+    window.addEventListener(PLAYER_PROFILE_UPDATED_EVENT, updateProfile);
+    return () => window.removeEventListener(PLAYER_PROFILE_UPDATED_EVENT, updateProfile);
+  }, []);
   async function submit(path: string, kind: "sync" | "retry" | "import") {
+    if (submitting.current || busy) return;
+    submitting.current = true;
     setAction(kind === "sync" ? "syncing" : kind === "retry" ? "retrying" : "importing");
     setLastAction(kind); setError(null); setMessage(null);
     try {
       const response = await fetch(path, { method: "POST" });
-      const payload = await response.json() as { jobId: string; error?: string };
+      if (response.status === 401) { window.location.assign("/login"); return; }
+      const payload = await response.json() as { jobId: string; job?: JobView; error?: string };
       if (!response.ok) throw new Error(payload.error || "提交任务失败");
       setJobId(payload.jobId);
-      setJob({ id: payload.jobId, kind, status: "queued", stage: "fetch", progress: { completed: 0, total: 0 }, createdAt: "", updatedAt: "" });
+      setJob(payload.job ?? { id: payload.jobId, kind, status: "queued", stage: "fetch", progress: { completed: 0, total: 0 }, createdAt: "", updatedAt: "" });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "提交任务失败");
       setLogOpen(true); setAction("idle");
+    } finally {
+      submitting.current = false;
     }
   }
   const startSync = () => submit("/api/sync", "sync");
@@ -67,30 +90,43 @@ export function DashboardShell({ initialData }: { initialData: DashboardPayload 
   const retryFailedJob = () => job && submit(`/api/jobs/${job.id}/retry`, job.kind);
   React.useEffect(() => {
     if (!jobId) return;
-    let disposed = false, timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    let finishedJob: JobView | null = null;
     async function poll() {
+      let interval = 2000;
       try {
-        const [jobResponse, dashboardResponse] = await Promise.all([
-          fetch(`/api/jobs/${jobId}`, { cache: "no-store" }), fetch("/api/dashboard", { cache: "no-store" }),
-        ]);
-        if (jobResponse.status === 401) { window.location.assign("/login"); return; }
-        if (!jobResponse.ok || !dashboardResponse.ok) throw new Error("暂时无法读取任务状态，正在重试…");
-        const currentJob = await jobResponse.json() as JobView;
-        const dashboard = await dashboardResponse.json() as DashboardPayload;
-        if (disposed) return;
-        setJob(currentJob); setData(dashboard); setError(null);
+        let currentJob = finishedJob;
+        if (!currentJob) {
+          const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store", signal: controller.signal });
+          if (response.status === 401) { window.location.assign("/login"); return; }
+          if (!response.ok) throw new Error("暂时无法读取任务状态，正在重试…");
+          currentJob = await response.json() as JobView;
+          if (controller.signal.aborted) return;
+          setJob(currentJob);
+        }
         if (currentJob.status === "succeeded" || currentJob.status === "failed") {
+          // The B50 and history only need refreshing after the job finishes.
+          // If that refresh fails, retry it without downloading the finished job again.
+          finishedJob = currentJob;
+          const response = await fetch("/api/dashboard", { cache: "no-store", signal: controller.signal });
+          if (response.status === 401) { window.location.assign("/login"); return; }
+          if (!response.ok) throw new Error("暂时无法刷新概览，正在重试…");
+          const dashboard = await response.json() as DashboardPayload;
+          if (controller.signal.aborted) return;
+          setData(currentJob.result?.snapshot ? { ...dashboard, latest: currentJob.result.snapshot } : dashboard);
           setJobId(null); setAction("idle");
-          if (currentJob.result?.snapshot) setData({ ...dashboard, latest: currentJob.result.snapshot });
           setMessage(currentJob.result?.message || null); setError(currentJob.error || null); setLogOpen(true);
           return;
         }
+        setError(null);
+        interval = currentJob.status === "queued" ? 500 : 1000;
         setAction(currentJob.kind === "sync" ? "syncing" : currentJob.kind === "retry" ? "retrying" : "importing");
-      } catch (caught) { if (!disposed) setError(caught instanceof Error ? caught.message : "正在重试读取任务状态…"); }
-      if (!disposed) timer = setTimeout(poll, 2000);
+      } catch (caught) { if (!controller.signal.aborted) setError(caught instanceof Error ? caught.message : "正在重试读取任务状态…"); }
+      if (!controller.signal.aborted) timer = setTimeout(poll, interval);
     }
     void poll();
-    return () => { disposed = true; clearTimeout(timer); };
+    return () => { controller.abort(); clearTimeout(timer); };
   }, [jobId]);
   const top10 = latest?.best50.slice(0, 10).reduce((sum, score) => sum + score.rating, 0) || 0;
   const rest40 = latest?.best50.slice(10).reduce((sum, score) => sum + score.rating, 0) || 0;
@@ -113,10 +149,10 @@ export function DashboardShell({ initialData }: { initialData: DashboardPayload 
       <section className="profile-section" id="overview" aria-label="玩家信息">
         <div className="profile-card">
           <div className="profile-avatar">
-            {latest?.user.avatarImageUrl ? (
+            {user?.avatarImageUrl ? (
               <img
-                src={latest.user.avatarImageUrl}
-                alt={`${latest.user.name || "玩家"} 头像`}
+                src={user.avatarImageUrl}
+                alt={`${user.name || "玩家"} 头像`}
                 loading="eager"
                 decoding="async"
               />
@@ -126,41 +162,42 @@ export function DashboardShell({ initialData }: { initialData: DashboardPayload 
           </div>
           <div className="profile-copy">
             <span className="score-label">PLAYER PROFILE</span>
-            <h2>{latest?.user.name || "ARCAEA PLAYER"}</h2>
+            <h2>{user?.name || "ARCAEA PLAYER"}</h2>
             <p>
-              {latest?.user.userCode ? `USER CODE ${latest.user.userCode}` : "等待首次同步"}
-              {latest?.user.country ? ` · ${latest.user.country}` : ""}
-              {latest?.user.joinDate ? <span className="profile-join-date"> · JOINED {formatJoinDate(latest.user.joinDate)}</span> : null}
+              {user?.userCode ? `USER CODE ${user.userCode}` : "等待首次同步"}
+              {user?.country ? ` · ${user.country}` : ""}
+              {user?.joinDate ? <span className="profile-join-date"> · JOINED {formatJoinDate(user.joinDate)}</span> : null}
             </p>
           </div>
           <div className="profile-potential">
             <span>POTENTIAL</span>
-            <strong>{latest ? latest.potential.toFixed(3) : "—"}</strong>
+            <strong>{user ? user.rating.toFixed(3) : "—"}</strong>
           </div>
         </div>
         <div className="profile-toolbar">
-          <Button className="sync-button" onClick={startSync} disabled={action !== "idle"}>
+          <Button className="sync-button" onClick={startSync} disabled={busy} aria-busy={action === "syncing"}>
             {action === "syncing" ? <Loader2 className="spin" size={16} /> : <CloudDownload size={16} />}
-            {action === "syncing" ? "获取中…" : "获取 B50 & 潜力图"}
+            {!interactive ? "正在准备…" : action === "syncing" ? isSubmitting ? "正在提交…" : "获取中…" : "获取 B50 & 潜力图"}
           </Button>
+          <VersionCheck initialVersion={data.version} interactive={interactive} />
         </div>
       </section>
 
-      {job ? <div className="job-status" role="status">
-        <span>{job.status === "queued" ? "等待处理" : job.status === "running" ? "正在同步" : job.status === "failed" ? "同步失败" : "同步完成"} · {({ fetch: "获取数据", history: "官网历史", media: "媒体处理", archive: "归档备份", done: "完成" } as Record<string, string>)[job.stage] || job.stage}
+      {isSubmitting ? <div className="job-status" role="status"><Loader2 className="spin" size={14} /><span>正在提交任务…</span></div> : job ? <div className="job-status" role="status">
+        <span>{job.status === "queued" ? "等待处理" : job.status === "running" ? "正在同步" : job.status === "failed" ? "同步失败" : "同步完成"} · {({ fetch: "获取数据", profile: "用户资料", history: "官网历史", media: "媒体处理", archive: "归档备份", done: "完成" } as Record<string, string>)[job.stage] || job.stage}
           {job.progress.total > 0 ? ` · ${job.progress.completed}/${job.progress.total}` : ""}</span>
-        {job.status === "failed" ? <Button size="sm" onClick={retryFailedJob} disabled={action !== "idle"}>重试任务</Button> : null}
+        {job.status === "failed" ? <Button size="sm" onClick={retryFailedJob} disabled={busy}>重试任务</Button> : null}
         {error ? <span>{error}</span> : null}
       </div> : null}
       <section className="section-block" id="b50">
         <div className="section-heading-row">
           <div><p className="section-kicker">RANKED PERFORMANCE</p><h2>BEST 50 <span>/ CURRENT ROTATION</span></h2></div>
-          {latest ? <div className="section-meta"><span className={`media-status media-${latest.mediaStatus ?? "complete"}`}>{mediaStatusLabel(latest.mediaStatus)}</span>{latest.mediaStatus === "failed" ? <Button className="media-retry-button" variant="danger" size="sm" onClick={retryMedia} disabled={action !== "idle"}><RefreshCw className={action === "retrying" ? "spin" : undefined} size={13} />{action === "retrying" ? "重试中…" : "重试媒体"}</Button> : null}<span className="last-fetch">LAST FETCH <strong>{formatRelativeDate(latest.fetchedAt)}</strong></span></div> : null}
+          {latest ? <div className="section-meta"><span className={`media-status media-${latest.mediaStatus ?? "complete"}`}>{mediaStatusLabel(latest.mediaStatus)}</span>{latest.mediaStatus === "failed" ? <Button className="media-retry-button" variant="danger" size="sm" onClick={retryMedia} disabled={busy}><RefreshCw className={action === "retrying" ? "spin" : undefined} size={13} />{action === "retrying" ? "重试中…" : "重试媒体"}</Button> : null}<span className="last-fetch">LAST FETCH <strong>{formatRelativeDate(latest.fetchedAt)}</strong></span></div> : null}
         </div>
         {latest ? (
           <>
-            <div className="formula-strip"><span><strong>TOP 10</strong> × 2 = {top10.toFixed(3)}</span><i /> <span><strong>REST 40</strong> = {rest40.toFixed(3)}</span> <span className="formula-result">TOTAL / 60 = <strong>{latest.weightedPotential.toFixed(3)}</strong></span></div>
-            <div className="score-grid">{latest.best50.map((score, index) => <ScoreCard key={`${score.songId}-${score.difficulty}-${index}`} score={score} rank={index + 1} />)}</div>
+            <div className="formula-strip"><span><strong>TOP 10</strong> × 2 = {top10.toFixed(6)}</span><i /> <span><strong>REST 40</strong> = {rest40.toFixed(6)}</span> <span className="formula-result">TOTAL / 60 = <strong>{((top10 * 2 + rest40) / 60).toFixed(6)}</strong></span></div>
+            <div className="score-grid">{latest.best50.map((score, index) => <ScoreCard key={`${score.songId}-${score.difficulty}-${index}`} score={score} rank={index + 1} showExport />)}</div>
           </>
         ) : <EmptyState title="还没有 B50 快照" description="使用玩家信息卡片下方的获取器登录 Lowiro，抓取并保存首份快照。" />}
       </section>
@@ -172,7 +209,7 @@ export function DashboardShell({ initialData }: { initialData: DashboardPayload 
         </CardHeader>
         <CardContent>
           <div className="chart-toolbar">
-            <Button size="sm" variant="secondary" onClick={importHistory} disabled={action !== "idle"}>{action === "importing" ? <Loader2 className="spin" size={13} /> : <CloudDownload size={13} />}{action === "importing" ? "同步中…" : "同步官网历史"}</Button>
+            <Button size="sm" variant="secondary" onClick={importHistory} disabled={busy}>{action === "importing" ? <Loader2 className="spin" size={13} /> : <CloudDownload size={13} />}{action === "importing" ? "同步中…" : "同步官网历史"}</Button>
             <div className="range-tabs" role="tablist" aria-label="折线图时间范围">
               {chartRanges.map((range) => (
                 <button

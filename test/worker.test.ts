@@ -11,12 +11,20 @@ import { compareSnapshots } from "../src/lib/history-diff";
 import type { Env, JobMessage } from "../src/lib/environment";
 import type { B50Snapshot } from "../src/lib/types";
 import { publicAssetUrl } from "../src/lib/r2";
+import { characterAssetId } from "../src/lib/score-export-profile";
 
 let env: Env, sent: JobMessage[];
 function fixture(id = "2026-10-14-first", potential = 12.5): B50Snapshot {
   return { id, fetchedAt: "2026-10-14T10:00:00.000Z", trigger: "manual", potential, weightedPotential: 12.5,
     user: { rating: potential, name: "Test" }, imageStats: { requested: 1, uploaded: 0, failed: 0, failures: [] }, mediaStatus: "complete",
     best50: Array.from({length:50}, (_,i) => ({ songId:`song${i}`, difficulty:2, modifier:0, rating:13-i/100, score:9900000,perfectCount:100,nearCount:0,missCount:0,clearType:1,title:{en:`Song ${i}`},artist:"Test",timePlayed:1700000000000,bg:"a".repeat(32) })) };
+}
+function uncachedFixture() {
+  const snapshot = fixture();
+  snapshot.best50.forEach((score, index) => { score.bg = index.toString(16).padStart(32, "0"); });
+  snapshot.user.characterId = 7;
+  snapshot.user.characterIcon = "c".repeat(32);
+  return snapshot;
 }
 function request(path: string, method = "GET", cookie = "", body?: unknown, origin = "https://arc.example") {
   return new Request(`https://arc.example${path}`, { method, headers: { origin, cookie, "content-type":"application/json" }, ...(body ? { body:JSON.stringify(body) } : {}) });
@@ -32,9 +40,26 @@ async function deliver(message:JobMessage) {
   return {ack,retry};
 }
 function mockLowiro(snapshot = fixture()) {
-  const client={ fetchB50Snapshot:vi.fn(async()=>({user:snapshot.user,best50:snapshot.best50})), getPotentialHistory:vi.fn(async()=>[{timePlayed:Date.parse(snapshot.fetchedAt),potential:snapshot.potential}]), getBest50:vi.fn(async()=>snapshot.best50), getOnlineImage:vi.fn(async()=>({body:new Uint8Array([1,2,3]).buffer,contentType:"image/png"})), getChartImage:vi.fn(async()=>({body:new Uint8Array([1,2,3]).buffer,contentType:"image/jpeg"})), getCharacterIconImage:vi.fn(async()=>({body:new Uint8Array([1]).buffer,contentType:"image/png"})) };
+  const client={ getUser:vi.fn(async()=>({...snapshot.user})), fetchB50Snapshot:vi.fn(async()=>({user:snapshot.user,best50:snapshot.best50})), getPotentialHistory:vi.fn(async()=>[{timePlayed:Date.parse(snapshot.fetchedAt),potential:snapshot.potential}]), getBest50:vi.fn(async()=>snapshot.best50), getOnlineImage:vi.fn(async()=>({body:new Uint8Array([1,2,3]).buffer,contentType:"image/png"})), getChartImage:vi.fn(async()=>({body:new Uint8Array([1,2,3]).buffer,contentType:"image/jpeg"})), getCharacterIconImage:vi.fn(async()=>({body:new Uint8Array([1]).buffer,contentType:"image/png"})), getBannerImage:vi.fn(async()=>({body:new Uint8Array([1,2]).buffer,contentType:"image/png"})) };
   vi.spyOn(ArcaeaClient,"login").mockResolvedValue(client as unknown as ArcaeaClient);
   return client;
+}
+function songScoreFixture() {
+  return { user_id: 123, song_id: "aegleseeker", difficulty: 2, score: 9960014,
+    shiny_perfect_count: 1469, perfect_count: 1559, near_count: 5, miss_count: 4,
+    clear_type: 1, best_clear_type: 5, modifier: 0, time_played: 1777211741898,
+    yearly_play_count: 8, title: { en: "Aegleseeker" }, artist: "Silentroom vs Frums", bg: "b".repeat(32) };
+}
+function mockSongApi(payload: unknown) {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const upstream = new Request(input, init);
+    const path = new URL(upstream.url).pathname;
+    if (path === "/auth/login") return Response.json({ isLoggedIn: true }, { headers: { "set-cookie": "lowiro=private-session; HttpOnly; Secure" } });
+    expect(upstream.headers.get("cookie")).toBe("lowiro=private-session");
+    if (path === "/webapi/user/me") return Response.json({ value: { rating: 12500, name: "Test" } });
+    if (path === "/webapi/score/song/me/all") return Response.json(payload);
+    throw new Error("Unexpected upstream request");
+  });
 }
 beforeEach(async()=>{
   const b=bindings as unknown as Env & {TEST_MIGRATIONS:Parameters<typeof applyD1Migrations>[1]};
@@ -59,7 +84,34 @@ it("uses Workers-compatible fetch options for Lowiro login and images", async ()
   const client = await ArcaeaClient.login(env);
   const image = await client.getChartImage("a".repeat(32));
   expect(image.contentType).toBe("image/jpeg"); expect(image.body.byteLength).toBe(5);
-  expect(fetch).toHaveBeenCalledTimes(3);
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+it("reports the upstream login status without exposing credentials or its response body", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ success: false, error_code: 104, detail: "private upstream body" }, { status: 400 }));
+  await expect(ArcaeaClient.login(env)).rejects.toMatchObject({
+    code: "ARCAEA_LOGIN_FAILED", message: "Arcaea 登录失败（HTTP 400，错误码 104），请检查账号配置或账号状态。",
+  });
+});
+
+it("fetches the profile and B50 together without an extra profile request during login", async () => {
+  let resolveUser!: (response: Response) => void, resolveScores!: (response: Response) => void;
+  const user = new Promise<Response>(resolve => { resolveUser = resolve; });
+  const scores = new Promise<Response>(resolve => { resolveScores = resolve; });
+  const upstream = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = new URL(new Request(input, init).url).pathname;
+    if (path === "/auth/login") return Response.json({ isLoggedIn: true }, { headers: { "set-cookie": "session=private; Secure" } });
+    if (path === "/webapi/user/me") return user;
+    if (path === "/webapi/score/rating/me") return scores;
+    throw new Error("Unexpected upstream request");
+  });
+  const client = await ArcaeaClient.login(env);
+  expect(upstream).toHaveBeenCalledTimes(1);
+  const pending = client.fetchB50Snapshot();
+  await vi.waitFor(() => expect(upstream).toHaveBeenCalledTimes(3));
+  resolveUser(Response.json({ value: { rating: 12500, name: "Test" } }));
+  resolveScores(Response.json({ value: { best_rated_scores: [{ ...songScoreFixture(), rating: 13 }] } }));
+  await expect(pending).resolves.toMatchObject({ user: { rating: 12.5 }, best50: [{ songId: "aegleseeker" }] });
 });
 
 describe("security headers",()=>{
@@ -123,7 +175,7 @@ describe("authentication and API",()=>{
     const get = vi.spyOn(env.ARCHIVE, 'get');
     const first = await api(env, request(path, 'GET', cookie));
     expect(first.headers.get('x-media-cache')).toBe('MISS');
-    expect(first.headers.get('cache-control')).toBe('private, max-age=3600');
+    expect(first.headers.get('cache-control')).toBe('private, max-age=31536000, immutable');
     expect(first.headers.get('cdn-cache-control')).toBe('no-store');
     expect(first.headers.get('vary')).toBe('Cookie');
     expect(new TextDecoder().decode(await first.arrayBuffer())).toBe('cached-image');
@@ -176,13 +228,647 @@ describe("authentication and API",()=>{
     expect(new TextDecoder().decode(await response.arrayBuffer())).toBe('image');
   });
 });
+describe("single-song queries", () => {
+  it("requires a panel session and validates queries before contacting Lowiro", async () => {
+    const upstreamLogin = vi.spyOn(ArcaeaClient, "login").mockRejectedValue(new Error("Unexpected login"));
+    expect((await api(env, request("/api/scores?term=Aegleseeker"))).status).toBe(401);
+    const cookie = await login();
+    expect((await api(env, request("/api/scores?term=Aegleseeker", "POST", cookie))).status).toBe(405);
+    for (const query of ["", "term=%20", `term=${"a".repeat(101)}`, "term=abc%00def", "term=abc&difficulty=5", "term=abc&page=0", "term=abc&page=1.5", "term=abc&page=10000", "term=abc&sort=unknown"]) {
+      const response = await api(env, request(`/api/scores?${query}`, "GET", cookie));
+      expect(response.status).toBe(400);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+    }
+    expect(upstreamLogin).not.toHaveBeenCalled();
+  });
+
+  it("encodes search terms, preserves official judgements and pagination, and strips private fields", async () => {
+    const bg = "b".repeat(32);
+    await env.ARCHIVE.put(`charts/${bg}.jpg`, "cached-art", { httpMetadata: { contentType: "image/jpeg" } });
+    const upstream = mockSongApi({ success: true, value: { scores: [{ ...songScoreFixture(), difficulty: 3, difficulty_alias: 1 }], count: 11 } });
+    const cookie = await login();
+    const response = await api(env, request("/api/scores?term=%20Dread%20%26%20Area%20&difficulty=3&page=2&sort=score_below_max", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const payload = await response.json() as { scores: Array<Record<string, unknown>>; count: number };
+    expect(payload.count).toBe(11);
+    expect(payload.scores[0]).toMatchObject({ songId: "aegleseeker", difficulty: 3, difficultyAlias: 1,
+      score: 9960014, perfectCount: 1559, shinyPerfectCount: 1469, nearCount: 5, missCount: 4,
+      clearType: 1, bestClearType: 5, yearlyPlayCount: 8, imageUrl: `/api/media/charts/${bg}.jpg` });
+    expect(payload.scores[0]).not.toHaveProperty("rating");
+    expect(payload.scores[0]).not.toHaveProperty("user_id");
+    expect(JSON.stringify(payload)).not.toContain("private-session");
+    expect(upstream).toHaveBeenCalledTimes(2);
+    const scoreRequest = upstream.mock.calls.find(([input]) => String(input).includes("/score/song/me/all"))!;
+    const params = new URL(String(scoreRequest[0])).searchParams;
+    expect(Object.fromEntries(params)).toEqual({ term: "Dread & Area", difficulty: "3", page: "2", sort: "score_below_max" });
+    expect(await new Store(env).latest()).toBeNull();
+  });
+
+  it("returns an empty result for an unplayed or unmatched chart", async () => {
+    const upstream = mockSongApi({ success: true, value: { scores: [], count: 0 } });
+    const cookie = await login();
+    const response = await api(env, request("/api/scores?term=not-played", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ scores: [], count: 0 });
+    const scoreRequest = upstream.mock.calls.find(([input]) => String(input).includes("/score/song/me/all"))!;
+    expect(Object.fromEntries(new URL(String(scoreRequest[0])).searchParams)).toEqual({ term: "not-played", difficulty: "2", page: "1", sort: "title" });
+  });
+
+  it.each([
+    { success: false, error_code: 999 },
+    { success: true, value: {} },
+    { success: true, value: { scores: [], count: "1" } },
+    { success: true, value: { scores: [songScoreFixture()], count: 0 } },
+    { success: true, value: { scores: [{ ...songScoreFixture(), shiny_perfect_count: 2000 }], count: 1 } },
+  ])("reports upstream failures and malformed scores instead of hiding them as empty results %#", async payload => {
+    mockSongApi(payload);
+    const cookie = await login();
+    const response = await api(env, request("/api/scores?term=Aegleseeker", "GET", cookie));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ code: expect.stringMatching(/^ARCAEA_SONG_/) });
+  });
+
+  it("caches new artwork in R2 and reuses it on subsequent searches", async () => {
+    const raw = songScoreFixture();
+    const getChartImage = vi.fn(async () => ({ body: new Uint8Array([1, 2, 3]).buffer, contentType: "image/jpeg" }));
+    const client = { getSongScores: vi.fn(async () => ({ scores: [{ songId: raw.song_id, bg: raw.bg }], count: 1 })), getChartImage };
+    vi.spyOn(ArcaeaClient, "login").mockResolvedValue(client as unknown as ArcaeaClient);
+    const cookie = await login();
+    for (let i = 0; i < 2; i++) {
+      const response = await api(env, request("/api/scores?term=Aegleseeker", "GET", cookie));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ scores: [{ imageUrl: `/api/media/charts/${raw.bg}.jpg` }] });
+    }
+    expect(getChartImage).toHaveBeenCalledExactlyOnceWith(raw.bg);
+    expect(await env.ARCHIVE.head(`charts/${raw.bg}.jpg`)).not.toBeNull();
+  });
+
+  it("keeps scores available when an artwork fetch fails", async () => {
+    const raw = songScoreFixture();
+    mockSongApi({ success: true, value: { scores: [raw], count: 1 } });
+    vi.spyOn(ArcaeaClient.prototype, "getChartImage").mockRejectedValue(new Error("Temporary artwork failure"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cookie = await login();
+    const response = await api(env, request("/api/scores?term=Aegleseeker", "GET", cookie));
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { scores: Array<Record<string, unknown>> };
+    expect(payload.scores[0].score).toBe(raw.score);
+    expect(payload.scores[0]).not.toHaveProperty("imageUrl");
+    expect(warning).toHaveBeenCalledOnce();
+  });
+
+  it("returns only local asset hints alongside song scores without fetching the user again", async () => {
+    const source = { ...uncachedFixture().user, characterId: 23, characterUncapped: true,
+      bannerResource: "b".repeat(32), email: "private@example.com", cookie: "private-session" };
+    await new Store(env).putCache("score-export", "profile", source);
+    const upstream = mockSongApi({ success: true, value: { scores: [], count: 0 } });
+    const cookie = await login();
+    const response = await api(env, request("/api/scores?term=Aegleseeker", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ scores: [], count: 0, exportHint: {
+      rating: 12.5, characterId: 23, characterUncapped: true, bannerResource: "b".repeat(32),
+    } });
+    expect(upstream.mock.calls.some(([input]) => String(input).includes("/user/me"))).toBe(false);
+  });
+
+  it("keeps song scores available if the optional export hint cache fails", async () => {
+    mockSongApi({ success: true, value: { scores: [], count: 0 } });
+    vi.spyOn(Store.prototype, "cache").mockRejectedValue(new Error("Temporary cache failure"));
+    const cookie = await login();
+    const response = await api(env, request("/api/scores?term=Aegleseeker", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ scores: [], count: 0 });
+  });
+});
+
+describe("score export profiles", () => {
+  async function syncB50(trigger: B50Snapshot["trigger"] = "manual") {
+    const job = await enqueue(env, "sync", trigger);
+    await deliver(sent.shift()!);
+    const result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");
+    return result;
+  }
+
+  it("protects profile reads and refreshes with authentication, origin and maintenance checks", async () => {
+    const upstream = vi.spyOn(ArcaeaClient, "login").mockRejectedValue(new Error("Unexpected login"));
+    expect((await api(env, request("/api/score-export/profile"))).status).toBe(401);
+    expect((await api(env, request("/api/score-export/profile", "POST"))).status).toBe(401);
+    const cookie = await login();
+    const invalid = await api(env, request("/api/score-export/profile", "DELETE", cookie));
+    expect(invalid.status).toBe(405);
+    expect(invalid.headers.get("allow")).toBe("GET, POST");
+    expect((await api(env, request("/api/score-export/profile", "POST", cookie, undefined, "https://evil.example"))).status).toBe(403);
+    expect((await api({ ...env, MUTATIONS_ENABLED: "false" }, request("/api/score-export/profile", "POST", cookie))).status).toBe(503);
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("refreshes export and dashboard profiles without modifying score snapshots or history", async () => {
+    const store = new Store(env), previous = fixture();
+    await store.writeSnapshot(previous);
+    const before = await store.history();
+    const source = uncachedFixture();
+    Object.assign(source.user, { name: "Current Player", rating: 13, characterId: 23, characterUncapped: true,
+      bannerId: "course_banner_8", bannerResource: "b".repeat(32) });
+    const client = mockLowiro(source);
+    env.R2_PUBLIC_URL = "https://images.example.com";
+    const cookie = await login();
+    const response = await api(env, request("/api/score-export/profile", "POST", cookie));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const timings = response.headers.get("server-timing");
+    expect(timings).toMatch(/auth;dur=\d/);
+    expect(timings).toMatch(/profile.total;dur=\d/);
+    expect(timings).toMatch(/d1.profile.write;dur=\d/);
+    expect(await response.json()).toMatchObject({ characterAssetId: "23u", user: { name: "Current Player", rating: 13,
+      avatarImageUrl: `/api/media/characters/${source.user.characterIcon}.png` }, bannerImageUrl: `/api/media/banners/${"b".repeat(32)}.png` });
+    const dashboard = await api(env, request("/api/dashboard", "GET", cookie));
+    expect(await dashboard.json()).toMatchObject({ user: { name: "Current Player", rating: 13,
+      avatarImageUrl: `https://images.example.com/characters/${source.user.characterIcon}.png` }, latest: { potential: 12.5, user: { name: "Test" } } });
+    expect(await store.snapshot(previous.id)).toEqual(previous);
+    expect(await store.snapshots()).toHaveLength(1);
+    expect(await store.history()).toEqual(before);
+    expect(client.getUser).toHaveBeenCalledTimes(1);
+    expect(client.fetchB50Snapshot).not.toHaveBeenCalled();
+    expect(client.getPotentialHistory).not.toHaveBeenCalled();
+    expect(client.getOnlineImage).not.toHaveBeenCalled();
+    expect(client.getCharacterIconImage).toHaveBeenCalledTimes(1);
+    expect(client.getBannerImage).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("allows a first export without B50 and reuses unchanged avatar and banner files", async () => {
+    const source = uncachedFixture();
+    Object.assign(source.user, { bannerId: "course_banner_8", bannerResource: "b".repeat(32) });
+    const client = mockLowiro(source), cookie = await login();
+    for (let index = 0; index < 2; index++) {
+      const response = await api(env, request("/api/score-export/profile", "POST", cookie));
+      expect(response.status).toBe(200);
+    }
+    expect(client.getUser).toHaveBeenCalledTimes(2);
+    expect(client.getCharacterIconImage).toHaveBeenCalledTimes(1);
+    expect(client.getBannerImage).toHaveBeenCalledTimes(1);
+    expect(await new Store(env).latest()).toBeNull();
+    expect(await (await api(env, request("/api/dashboard", "GET", cookie))).json()).toMatchObject({ user: { name: "Test" }, latest: null });
+    delete source.user.bannerResource; delete source.user.bannerId;
+    source.user.characterIcon = "d".repeat(32);
+    source.user.characterUncapped = true;
+    source.user.characterUncappedOverride = true;
+    const response = await api(env, request("/api/score-export/profile", "POST", cookie));
+    const profile = await response.json();
+    expect(profile).toMatchObject({ characterAssetId: "7", user: { avatarImageUrl: `/api/media/characters/${"d".repeat(32)}.png` } });
+    expect(profile).not.toHaveProperty("bannerImageUrl");
+    expect(profile).not.toHaveProperty("user.bannerImageKey");
+  });
+
+  it("keeps the last good profile if a fresh profile or banner request fails", async () => {
+    const store = new Store(env), old = { rating: 12.5, name: "Previous Player", characterId: 7 };
+    await store.putCache("score-export", "profile", old);
+    const source = uncachedFixture();
+    Object.assign(source.user, { bannerResource: "b".repeat(32) });
+    const client = mockLowiro(source), cookie = await login();
+    client.getUser.mockRejectedValueOnce(new Error("Temporary profile failure"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await api(env, request("/api/score-export/profile", "POST", cookie))).status).toBe(500);
+    expect((await store.cache("score-export")).profile).toEqual(old);
+    client.getBannerImage.mockRejectedValueOnce(new Error("Temporary banner failure"));
+    const response = await api(env, request("/api/score-export/profile", "POST", cookie));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ code: "EXPORT_BANNER_UNAVAILABLE" });
+    expect((await store.cache("score-export")).profile).toEqual(old);
+    expect((await api(env, request("/api/score-export/profile", "POST", cookie))).status).toBe(200);
+  });
+
+  it("rejects incomplete live user data before overwriting a valid profile", async () => {
+    const store = new Store(env), old = { rating: 12.5, name: "Previous Player", characterId: 7 };
+    await store.putCache("score-export", "profile", old);
+    mockLowiro(fixture());
+    const cookie = await login();
+    const response = await api(env, request("/api/score-export/profile", "POST", cookie));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ code: "EXPORT_PROFILE_INVALID" });
+    expect((await store.cache("score-export")).profile).toEqual(old);
+  });
+
+  it("selects the partner's awakened art and honors the illustration override", () => {
+    const user = { rating: 12.9, characterId: 23, characterUncapped: true, characterUncappedOverride: false };
+    expect(characterAssetId(user)).toBe("23u");
+    expect(characterAssetId({ ...user, characterUncappedOverride: true })).toBe("23");
+    expect(characterAssetId({ ...user, characterUncapped: false })).toBe("23");
+    expect(characterAssetId({ ...user, characterId: 7 })).toBe("7");
+    for (const characterId of [undefined, -1, 2.5, 99999]) expect(characterAssetId({ ...user, characterId })).toBeNull();
+  });
+
+  it("preserves normalized partner flags without exposing private upstream fields", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const upstream = new Request(input, init);
+      if (new URL(upstream.url).pathname === "/auth/login") {
+        return Response.json({ isLoggedIn: true }, { headers: { "set-cookie": "lowiro=private-session; Secure" } });
+      }
+      return Response.json({ value: { name: "Current Player", user_code: "123456789", rating: 12939,
+        email: "private@example.com", character: 23, character_stats: [
+          { character_id: 1, is_uncapped: false },
+          { character_id: 23, is_uncapped: true, is_uncapped_override: false, private_field: "do not expose" },
+        ] } });
+    });
+    const client = await ArcaeaClient.login(env);
+    await new Store(env).putCache("score-export", "profile", await client.getUser());
+    fetch.mockClear();
+    fetch.mockRejectedValue(new Error("Export must not contact Lowiro"));
+    const cookie = await login();
+    const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ characterAssetId: "23u", user: { name: "Current Player", userCode: "123456789",
+      rating: 12.939, characterId: 23, characterUncapped: true, characterUncappedOverride: false } });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(await new Store(env).latest()).toBeNull();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("syncs the official avatar once and exports locally even without Lowiro credentials", async () => {
+    const snapshot = uncachedFixture();
+    snapshot.user.characterId = 23;
+    snapshot.user.characterUncapped = true;
+    const client = mockLowiro(snapshot);
+    env.R2_PUBLIC_URL = "https://images.example.com";
+    const cookie = await login();
+    await syncB50();
+    vi.mocked(ArcaeaClient.login).mockRejectedValue(new Error("Lowiro offline"));
+    delete env.USERNAME; delete env.PASSWD;
+    for (let i = 0; i < 2; i++) {
+      const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ characterAssetId: "23u", user: {
+        avatarImageUrl: `/api/media/characters/${snapshot.user.characterIcon}.png`,
+      } });
+    }
+    expect(ArcaeaClient.login).toHaveBeenCalledTimes(1);
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(1);
+    expect(client.getUser).not.toHaveBeenCalled();
+    expect(client.getCharacterIconImage).toHaveBeenCalledExactlyOnceWith(snapshot.user.characterIcon);
+    expect(await env.ARCHIVE.head(`characters/${snapshot.user.characterIcon}.png`)).not.toBeNull();
+  });
+
+  it.each(["manual", "cron", "daily"] as const)("updates export data on %s sync even when B50 is unchanged", async trigger => {
+    const snapshot = uncachedFixture(), client = mockLowiro(snapshot), store = new Store(env);
+    const cookie = await login();
+    await syncB50();
+    snapshot.user.name = "Changed Player";
+    snapshot.user.rating = 13;
+    snapshot.user.characterId = 23;
+    snapshot.user.characterUncapped = true;
+    const before = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(await before.json()).toMatchObject({ characterAssetId: "7", user: { name: "Test", rating: 12.5 } });
+    const updated = await syncB50(trigger);
+    expect(updated.result?.recorded).toBe(false);
+    expect(await store.snapshots()).toHaveLength(1);
+    expect((await store.latest())?.user.name).toBe("Test");
+    const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(await response.json()).toMatchObject({ characterAssetId: "23u", user: { name: "Changed Player", rating: 13 } });
+    const dashboard = await api(env, request("/api/dashboard", "GET", cookie));
+    expect(await dashboard.json()).toMatchObject({ user: { name: "Changed Player", rating: 13 } });
+    expect(ArcaeaClient.login).toHaveBeenCalledTimes(2);
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(2);
+    expect(client.getUser).not.toHaveBeenCalled();
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("settles overlapping profile and history work before retrying an unchanged B50", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const snapshot = uncachedFixture(), client = mockLowiro(snapshot), store = new Store(env);
+    await syncB50();
+    snapshot.user.name = "Changed Player";
+    snapshot.user.bannerResource = "b".repeat(32);
+    client.getBannerImage.mockRejectedValueOnce(new Error("Temporary banner failure"));
+    let releaseHistory!: () => void;
+    const history = new Promise<void>(resolve => { releaseHistory = resolve; });
+    client.getPotentialHistory.mockImplementationOnce(async () => { await history; return []; });
+    const exporting = vi.spyOn(Store.prototype, "exportArchive");
+    const job = await enqueue(env, "sync"), running = deliver(sent.shift()!);
+    try {
+      await vi.waitFor(() => {
+        expect(client.getBannerImage).toHaveBeenCalledOnce();
+        expect(client.getPotentialHistory).toHaveBeenCalledTimes(2);
+      });
+      expect((await getJob(env, job.jobId)).status).toBe("running");
+      expect(exporting).not.toHaveBeenCalled();
+    } finally { releaseHistory(); }
+    await running;
+    expect((await getJob(env, job.jobId)).status).toBe("queued");
+    expect((await store.cache<{ name: string }>("score-export", ["profile"])).profile.name).toBe("Test");
+    await deliver(sent.shift()!);
+    const result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");
+    expect(result.result?.recorded).toBe(false);
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(2);
+    expect(await store.snapshots()).toHaveLength(1);
+    expect((await store.cache<{ name: string }>("score-export", ["profile"])).profile.name).toBe("Changed Player");
+    expect(await env.ARCHIVE.head(`banners/${"b".repeat(32)}.png`)).not.toBeNull();
+  });
+
+  it("asks for a B50 sync when no usable profile exists, without an upstream fallback", async () => {
+    const upstream = vi.spyOn(ArcaeaClient, "login").mockRejectedValue(new Error("Unexpected login"));
+    const cookie = await login();
+    for (const user of [undefined, { rating: 12.5, name: "Test" }, { rating: 12.5, characterId: 23 }]) {
+      if (user) await new Store(env).putCache("score-export", "profile", user);
+      const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ code: "EXPORT_PROFILE_MISSING", error: expect.stringContaining("B50") });
+    }
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("uses legacy snapshot data and already-cached media without loading scores or writing a cache", async () => {
+    const store = new Store(env), snapshot = uncachedFixture();
+    Object.assign(snapshot.user, { characterId: 23, characterUncapped: true, bannerResource: "b".repeat(32),
+      avatarImageKey: `characters/${"c".repeat(32)}.png`, avatarImageUrl: "https://images.example.com/avatar.png" });
+    await store.writeSnapshot(snapshot);
+    await env.ARCHIVE.put(`banners/${"b".repeat(32)}.png`, "banner");
+    const cookie = await login();
+    const upstream = vi.spyOn(ArcaeaClient, "login").mockRejectedValue(new Error("Unexpected login"));
+    const snapshots = vi.spyOn(Store.prototype, "latest"), writing = vi.spyOn(Store.prototype, "putCache");
+    const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ characterAssetId: "23u", user: { avatarImageUrl: `/api/media/characters/${"c".repeat(32)}.png` }, bannerImageUrl: `/api/media/banners/${"b".repeat(32)}.png` });
+    expect(upstream).not.toHaveBeenCalled(); expect(snapshots).not.toHaveBeenCalled(); expect(writing).not.toHaveBeenCalled();
+    await env.ARCHIVE.delete(`banners/${"b".repeat(32)}.png`);
+    expect((await api(env, request("/api/score-export/profile", "GET", cookie))).status).toBe(409);
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("selects the equipped banner, honors hidden plates and defaults to the highest course", async () => {
+    const banners = [
+      { id: "course_banner_2", resource: "2".repeat(32) },
+      { id: "course_banner_10", resource: "a".repeat(32) },
+      { id: "online_banner_2026_10", resource: "b".repeat(32) },
+      { id: "../private", resource: "c".repeat(32) },
+      { id: "course_banner_999", resource: "../../private" },
+    ];
+    let custom: unknown = "online_banner_2026_10";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const upstream = new Request(input, init);
+      if (new URL(upstream.url).pathname === "/auth/login") {
+        return Response.json({ isLoggedIn: true }, { headers: { "set-cookie": "lowiro=private-session; Secure" } });
+      }
+      return Response.json({ value: { name: "Current Player", rating: 12939, character: 23, banners, custom_banner: custom } });
+    });
+    const client = await ArcaeaClient.login(env);
+    expect(await client.getUser()).toMatchObject({ bannerId: "online_banner_2026_10", bannerResource: "b".repeat(32) });
+    for (custom of [undefined, "not-owned", "../private"]) {
+      expect(await client.getUser()).toMatchObject({ bannerId: "course_banner_10", bannerResource: "a".repeat(32) });
+    }
+    custom = "hidden";
+    expect(await client.getUser()).not.toHaveProperty("bannerResource");
+  });
+
+  it("syncs banner hashes once and updates or hides the selection only on the next B50 sync", async () => {
+    const snapshot = uncachedFixture();
+    snapshot.user.bannerId = "online_banner_2026_10";
+    snapshot.user.bannerResource = "b".repeat(32);
+    const client = mockLowiro(snapshot);
+    env.R2_PUBLIC_URL = "https://images.example.com";
+    const cookie = await login();
+    await syncB50(); await syncB50();
+    for (let i = 0; i < 2; i++) {
+      const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ bannerImageUrl: `/api/media/banners/${"b".repeat(32)}.png` });
+    }
+    expect(client.getBannerImage).toHaveBeenCalledExactlyOnceWith("b".repeat(32));
+    const path = `/api/media/banners/${"b".repeat(32)}.png`;
+    expect((await api(env, request(path))).status).toBe(401);
+    const image = await api(env, request(path, "GET", cookie));
+    expect(image.status).toBe(200);
+    expect(image.headers.get("cache-control")).toContain("private");
+    expect(new Uint8Array(await image.arrayBuffer())).toEqual(new Uint8Array([1, 2]));
+    snapshot.user.bannerResource = "d".repeat(32);
+    const before = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(await before.json()).toMatchObject({ bannerImageUrl: `/api/media/banners/${"b".repeat(32)}.png` });
+    await syncB50();
+    const changed = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(await changed.json()).toMatchObject({ bannerImageUrl: `/api/media/banners/${"d".repeat(32)}.png` });
+    expect(client.getBannerImage).toHaveBeenCalledTimes(2);
+    delete snapshot.user.bannerResource; delete snapshot.user.bannerId;
+    await syncB50();
+    expect(await (await api(env, request("/api/score-export/profile", "GET", cookie))).json()).not.toHaveProperty("bannerImageUrl");
+    expect(client.getBannerImage).toHaveBeenCalledTimes(2);
+  });
+
+  it("checkpoints banner failures in the B50 job and retries without refetching scores", async () => {
+    const snapshot = uncachedFixture();
+    snapshot.user.bannerId = "online_banner_2026_10";
+    snapshot.user.bannerResource = "b".repeat(32);
+    const client = mockLowiro(snapshot), store = new Store(env);
+    await store.putCache("score-export", "profile", { rating: 10, name: "Previously synced", characterId: 7 });
+    client.getBannerImage.mockRejectedValueOnce(new Error("Temporary banner failure"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let releaseImage!: () => void;
+    const image = new Promise<void>(resolve => { releaseImage = resolve; });
+    client.getOnlineImage.mockImplementationOnce(async () => {
+      await image;return { body: new Uint8Array([1, 2, 3]).buffer, contentType: "image/png" };
+    });
+    const cookie = await login(), job = await enqueue(env, "sync");
+    const running = deliver(sent.shift()!);
+    try {
+      await vi.waitFor(() => {
+        expect(client.getBannerImage).toHaveBeenCalledOnce();
+        expect(client.getOnlineImage).toHaveBeenCalledOnce();
+      });
+      expect((await getJob(env, job.jobId)).status).toBe("running");
+    } finally { releaseImage(); }
+    await running;
+    expect(await getJob(env, job.jobId)).toMatchObject({ status: "queued", stage: "media" });
+    const unchanged = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(await unchanged.json()).toMatchObject({ user: { name: "Previously synced" } });
+    expect(await env.ARCHIVE.head(`banners/${"b".repeat(32)}.png`)).toBeNull();
+    await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+    const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ user: { name: "Test" }, bannerImageUrl: `/api/media/banners/${"b".repeat(32)}.png` });
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(1);
+    expect(client.getBannerImage).toHaveBeenCalledTimes(2);
+    expect(client.getCharacterIconImage).toHaveBeenCalledTimes(1);
+    expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
+    expect(client.getChartImage).toHaveBeenCalledTimes(50);
+  });
+
+  it("rejects invalid banner resource paths before requesting an image", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ isLoggedIn: true }, { headers: { "set-cookie": "session=test" } }));
+    const client = await ArcaeaClient.login(env);
+    for (const resource of ["../../private", "https://example.com/image", "b".repeat(33)]) {
+      await expect(client.getBannerImage(resource)).rejects.toMatchObject({ code: "ARCAEA_BANNER_INVALID" });
+    }
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the matching bundled avatar available when the upstream image fails during sync", async () => {
+    const client = mockLowiro(uncachedFixture());
+    client.getCharacterIconImage.mockRejectedValueOnce(new Error("Temporary icon failure"));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cookie = await login();
+    await syncB50();
+    const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ characterAssetId: "7", user: { name: "Test" } });
+  });
+
+  it("retains B50 scores for unsupported partners and reports their missing export art", async () => {
+    const snapshot = fixture();
+    snapshot.user.characterId = 99999;
+    mockLowiro(snapshot);
+    const cookie = await login();
+    await syncB50();
+    const response = await api(env, request("/api/score-export/profile", "GET", cookie));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ code: "CHARACTER_ART_UNAVAILABLE" });
+  });
+});
+
 describe("D1 archives",()=>{
+  it("reads only requested media cache keys within D1's parameter limit", async () => {
+    const store = new Store(env);
+    await store.putCaches([
+      { kind: "chart", key: "cache0", value: "first" },
+      { kind: "chart", key: "cache149", value: "last" },
+      { kind: "chart", key: "unrelated", value: "ignored" },
+      { kind: "character", key: "cache0", value: "wrong kind" },
+    ]);
+    const sql = vi.spyOn(store, "sql");
+    const keys = Array.from({ length: 150 }, (_, index) => `cache${index}`);
+    expect(await store.cache<string>("chart", [...keys, ...keys])).toEqual({ cache0: "first", cache149: "last" });
+    expect(sql.mock.calls).toHaveLength(2);
+    for (const [, ...values] of sql.mock.calls) expect(values.length).toBeLessThanOrEqual(100);
+    sql.mockClear();
+    expect(await store.cache("character", [])).toEqual({});
+    expect(sql).not.toHaveBeenCalled();
+  });
+  it("does not rewrite unchanged official history and resolves repeated timestamps", async () => {
+    const store = new Store(env);
+    const points = Array.from({ length: 200 }, (_, index) => ({ timePlayed: Date.parse("2026-10-01T00:00:00Z") + index * 3_600_000, potential: 12 + index / 1000 }));
+    expect(await store.mergeOfficial(points)).toEqual({ received: 200, total: 200 });
+    const batch = vi.spyOn(env.DB, "batch");
+    expect(await store.mergeOfficial([...points, points[0]])).toEqual({ received: 201, total: 200 });
+    expect(batch).not.toHaveBeenCalled();
+    const corrected = { ...points[0], potential: 13 };
+    expect(await store.mergeOfficial([corrected, points[0]])).toEqual({ received: 2, total: 200 });
+    expect(batch).not.toHaveBeenCalled();
+    await store.mergeOfficial([points[0], corrected]);
+    expect((await store.history())[0].potential).toBe(13);
+  });
+  it("enriches current snapshots without querying the alias table", async () => {
+    const store = new Store(env), snapshot = fixture();
+    snapshot.best50[0].difficulty = 3;
+    snapshot.best50[0].difficultyAlias = 1;
+    snapshot.best50[0].imageKey = "charts/current.jpg";
+    const prepare = vi.spyOn(env.DB, "prepare");
+    const [enriched] = await store.enrich([snapshot]);
+    expect(enriched.best50[0]).toMatchObject({ difficultyAlias: 1, imageUrl: "/api/media/charts/current.jpg" });
+    expect(enriched.best50[1].difficultyAlias).toBeUndefined();
+    expect(prepare).not.toHaveBeenCalled();
+  });
+  it("loads only missing legacy aliases and stays within D1's parameter limit", async () => {
+    const store = new Store(env);
+    const snapshots = Array.from({ length: 3 }, (_, page) => {
+      const snapshot = fixture(`legacy-${page}`);
+      snapshot.best50.forEach((score, index) => { score.songId = `legacy${page * 50 + index}`; score.difficulty = 3; });
+      return snapshot;
+    });
+    Object.assign(snapshots[0].best50[0], { difficultyAlias: null });
+    await store.putCache("alias", "legacy0:3", 1);
+    await store.putCache("alias", "legacy149:3", 1);
+    await store.putCache("alias", "unrelated:3", 1);
+    const sql = vi.spyOn(store, "sql");
+    const enriched = await store.enrich(snapshots);
+    expect(enriched[0].best50[0].difficultyAlias).toBe(1);
+    expect(enriched[2].best50[49].difficultyAlias).toBe(1);
+    expect(enriched[1].best50[0].difficultyAlias).toBeUndefined();
+    expect(sql.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(sql.mock.calls.flatMap(([, ...keys]) => keys)).toHaveLength(150);
+    for (const [, ...keys] of sql.mock.calls) expect(keys.length).toBeLessThanOrEqual(100);
+  });
   it("keeps daily maximum and latest chronologically, writes stable snapshots",async()=>{
     const store=new Store(env),first=fixture();await store.writeSnapshot(first);
     const later={...fixture('later',12.1),fetchedAt:'2026-10-14T11:00:00.000Z'};await store.writeSnapshot(later);await store.writeSnapshot(first);
     await store.mergeOfficial([{timePlayed:Date.parse('2026-10-14T12:00:00Z'),potential:12.8}]);
     expect((await store.snapshots()).length).toBe(2);expect((await store.latest())!.id).toBe('later');expect((await store.history())[0].potential).toBe(12.8);
     await store.exportArchive();expect(await env.ARCHIVE.head('exports/b50-history.csv')).not.toBeNull();
+  });
+  it("serves history summaries and on-demand snapshot detail",async()=>{
+    const store=new Store(env);await store.writeSnapshot(fixture());
+    const legacy={...fixture('2026-09-19-154914.321',11.4),fetchedAt:'2026-09-19T15:49:14.321Z'};await store.writeSnapshot(legacy);
+    const later={...fixture('2026-10-15-second',12.9),fetchedAt:'2026-10-15T11:00:00.000Z'};await store.writeSnapshot(later);
+    const summaries=await store.snapshotSummaries();
+    expect(summaries.map(summary=>summary.id)).toEqual(['2026-10-15-second','2026-10-14-first','2026-09-19-154914.321']);
+    expect(summaries[2]).toMatchObject({potential:11.4,trigger:'manual',entries:50});
+    const cookie=await login();
+    expect((await api(env,request('/api/snapshots/missing','GET',cookie))).status).toBe(404);
+    for(const id of [later.id,legacy.id]){
+      const response=await api(env,request(`/api/snapshots/${id}`,'GET',cookie));
+      expect(response.status).toBe(200);expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(await response.json()).toMatchObject({id,potential:id===legacy.id?11.4:12.9,mediaStatus:'complete'});
+    }
+    expect((await api(env,request('/api/snapshots/2026-09-19-154914.321'))).status).toBe(401);
+  });
+  it("skips redundant archive exports when nothing changed",async()=>{
+    const store=new Store(env);await store.writeSnapshot(fixture());
+    const put=vi.spyOn(env.ARCHIVE,'put');
+    const exportWrites=()=>put.mock.calls.filter(([key])=>String(key).startsWith('exports/')).length;
+    await store.exportArchive();const writes=exportWrites();expect(writes).toBeGreaterThan(0);
+    await store.exportArchive();expect(exportWrites()).toBe(writes);
+    await store.mergeOfficial([{timePlayed:Date.parse('2026-10-16T10:00:00Z'),potential:13}]);
+    await store.exportArchive();expect(exportWrites()).toBeGreaterThan(writes);
+  });
+  it("refreshes exports after correcting existing snapshots or official PTT points", async () => {
+    const store = new Store(env), snapshot = fixture();
+    const point = { timePlayed: Date.parse("2026-10-16T10:00:00Z"), potential: 13 };
+    await store.writeSnapshot(snapshot);await store.mergeOfficial([point]);await store.exportArchive();
+    snapshot.best50[0].imageKey = "charts/updated.jpg";
+    await store.writeSnapshot(snapshot);await store.exportArchive();
+    const scores = await (await env.ARCHIVE.get("exports/b50-history.json"))!.json<B50Snapshot[]>();
+    expect(scores[0].best50[0].imageUrl).toBe("/api/media/charts/updated.jpg");
+    await store.mergeOfficial([{ ...point, potential: 13.1 }]);await store.exportArchive();
+    const history = await (await env.ARCHIVE.get("exports/ptt-history.json"))!.json<Array<{ potential: number }>>();
+    expect(history.at(-1)?.potential).toBe(13.1);
+  });
+  it("rolls media and profile cache entries back when their snapshot transaction fails", async () => {
+    const store = new Store(env), snapshot = fixture();
+    await store.writeSnapshot(snapshot);
+    await store.putCache("score-export", "profile", snapshot.user);
+    const changed = structuredClone(snapshot);
+    changed.best50[0].imageKey = "charts/new.jpg";
+    changed.user.name = "Changed user";
+    await env.DB.prepare("CREATE TRIGGER reject_snapshot_update BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(ABORT,'injected snapshot failure'); END").run();
+    try {
+      await expect(store.writeSnapshot(changed, [
+        { kind: "chart", key: "new", value: { imageKey: "charts/new.jpg" } },
+        { kind: "score-export", key: "profile", value: changed.user },
+      ])).rejects.toThrow();
+      expect((await store.cache("chart", ["new"])).new).toBeUndefined();
+      expect((await store.cache("score-export", ["profile"])).profile).toEqual(snapshot.user);
+      expect((await store.snapshot(snapshot.id))?.best50[0].imageKey).toBeUndefined();
+    } finally { await env.DB.prepare("DROP TRIGGER reject_snapshot_update").run(); }
+  });
+  it("settles all archive writes before retrying a failed export", async () => {
+    const store = new Store(env);await store.writeSnapshot(fixture());
+    const original = env.ARCHIVE.put.bind(env.ARCHIVE), failure = new Error("R2 temporarily unavailable");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const put = vi.spyOn(env.ARCHIVE, "put").mockImplementation(async (...args) => {
+      if (args[0] === "exports/b50-history.json") throw failure;
+      if (args[0] === "exports/ptt-history.json") await gate;
+      return original(...args);
+    });
+    let settled = false;
+    const exporting = store.exportArchive().then(() => { settled = true; return null; }, error => { settled = true; return error; });
+    try {
+      await vi.waitFor(() => expect(put).toHaveBeenCalledTimes(4));
+      expect(settled).toBe(false);
+    } finally { release(); }
+    expect(await exporting).toBe(failure);
+    expect((await store.cache("export")).fingerprint).toBeUndefined();
   });
   it("retains the B50 formula and comparisons",()=>{
     expect(calculateWeightedPotential(Array(50).fill(12))).toBe(12);
@@ -191,6 +877,386 @@ describe("D1 archives",()=>{
   });
 });
 describe("durable queue pipeline",()=>{
+  it("prepares profile assets, history and score media together before committing one complete user", async () => {
+    const snapshot = uncachedFixture(), store = new Store(env);
+    snapshot.user.bannerResource = "b".repeat(32);
+    const client = mockLowiro(snapshot);
+    await store.putCache("score-export", "profile", { name: "Previous user", rating: 10 });
+    let releaseBanner!: () => void;
+    const banner = new Promise<void>(resolve => { releaseBanner = resolve; });
+    client.getBannerImage.mockImplementation(async () => {
+      await banner;return { body: new Uint8Array([1, 2]).buffer, contentType: "image/png" };
+    });
+    const exporting = vi.spyOn(Store.prototype, "exportArchive");
+    const job = await enqueue(env, "sync"), running = deliver(sent.shift()!);
+    try {
+      await vi.waitFor(() => {
+        expect(client.getBannerImage).toHaveBeenCalledOnce();
+        expect(client.getCharacterIconImage).toHaveBeenCalledOnce();
+        expect(client.getPotentialHistory).toHaveBeenCalledOnce();
+        expect(client.getOnlineImage).toHaveBeenCalledOnce();
+        expect(client.getChartImage).toHaveBeenCalledTimes(3);
+      });
+      expect((await getJob(env, job.jobId)).status).toBe("running");
+      expect((await store.cache<{ name: string }>("score-export", ["profile"])).profile.name).toBe("Previous user");
+      expect(exporting).not.toHaveBeenCalled();
+    } finally { releaseBanner(); }
+    await running;
+    const result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");
+    expect(result.result?.snapshot?.user).toMatchObject({ name: "Test", bannerImageKey: `banners/${"b".repeat(32)}.png`, avatarImageKey: `characters/${snapshot.user.characterIcon}.png` });
+    expect((await store.cache("score-export", ["profile"])).profile).toEqual(result.result?.snapshot?.user);
+    expect(client.getCharacterIconImage).toHaveBeenCalledOnce();
+    expect(client.getChartImage).toHaveBeenCalledTimes(50);
+  });
+  it("reuses previous covers and avatar when scores change, downloading only the new cover", async () => {
+    const previous = uncachedFixture(), store = new Store(env);
+    previous.best50.forEach(score => { score.imageKey = `charts/${score.bg}.jpg`; });
+    previous.user.avatarImageKey = `characters/${previous.user.characterIcon}.png`;
+    previous.potentialImageKey = `potential/${previous.id}.image`;
+    await store.writeSnapshot(previous);
+    const remote = structuredClone(previous);
+    for (const score of remote.best50) { delete score.imageKey;delete score.imageUrl; }
+    delete remote.user.avatarImageKey;delete remote.user.avatarImageUrl;
+    remote.best50[0].score += 100;
+    remote.best50[1].bg = "f".repeat(32);
+    const client = mockLowiro(remote), head = vi.spyOn(env.ARCHIVE, "head"), cache = vi.spyOn(Store.prototype, "cache");
+    const job = await enqueue(env, "sync");await deliver(sent.shift()!);
+    const result = (await getJob(env, job.jobId)).result!;
+    expect(result.recorded).toBe(true);expect(result.snapshot?.mediaStatus).toBe("complete");
+    expect(result.snapshot?.best50[0].score).toBe(remote.best50[0].score);
+    expect(client.getChartImage).toHaveBeenCalledExactlyOnceWith("f".repeat(32));
+    expect(client.getOnlineImage).toHaveBeenCalledTimes(1);expect(client.getCharacterIconImage).not.toHaveBeenCalled();
+    expect(head.mock.calls.map(([key]) => key).filter(key => key.startsWith("charts/"))).toEqual([`charts/${"f".repeat(32)}.jpg`]);
+    expect(cache.mock.calls.filter(([kind]) => kind === "chart").map(([, keys]) => keys)).toEqual([["f".repeat(32)]]);
+    expect(result.snapshot?.imageStats).toMatchObject({ requested: 50, uploaded: 1, cached: 49 });
+    expect(result.snapshot?.user.avatarImageKey).toBe(previous.user.avatarImageKey);
+    expect(result.snapshot?.potentialImageKey).not.toBe(previous.potentialImageKey);
+  });
+  it("processes changed B50 media while official history is still loading", async () => {
+    const client = mockLowiro();
+    let releaseHistory!: () => void, releaseImage!: () => void;
+    const history = new Promise<void>(resolve => { releaseHistory = resolve; });
+    const image = new Promise<void>(resolve => { releaseImage = resolve; });
+    client.getPotentialHistory.mockImplementation(async () => { await history;return []; });
+    client.getOnlineImage.mockImplementation(async () => { await image;return { body: new Uint8Array([1]).buffer, contentType: "image/png" }; });
+    const job = await enqueue(env, "sync"), running = deliver(sent.shift()!);
+    try {
+      await vi.waitFor(() => { expect(client.getPotentialHistory).toHaveBeenCalledTimes(1);expect(client.getOnlineImage).toHaveBeenCalledTimes(1); });
+      expect((await getJob(env, job.jobId)).status).toBe("running");
+    } finally { releaseHistory();releaseImage(); }
+    await running;
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+  });
+  it("keeps the second image slot working while potential-image generation is blocked", async () => {
+    const client = mockLowiro(uncachedFixture());
+    let release!: () => void, active = 0, maximum = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    client.getOnlineImage.mockImplementation(async () => {
+      maximum = Math.max(maximum, ++active);
+      try { await gate;return { body: new Uint8Array([1]).buffer, contentType: "image/png" }; }
+      finally { active--; }
+    });
+    client.getChartImage.mockImplementation(async () => {
+      maximum = Math.max(maximum, ++active);
+      try { await Promise.resolve();return { body: new Uint8Array([1]).buffer, contentType: "image/jpeg" }; }
+      finally { active--; }
+    });
+    const job = await enqueue(env, "sync"), running = deliver(sent.shift()!);
+    try { await vi.waitFor(() => expect(client.getChartImage.mock.calls.length).toBeGreaterThanOrEqual(3)); }
+    finally { release(); }
+    await running;
+    expect(maximum).toBe(2);expect(client.getChartImage).toHaveBeenCalledTimes(50);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+  });
+  it("does not mark unpersisted uploads done when history finishes during a failed snapshot write", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = mockLowiro(uncachedFixture()), original = Store.prototype.writeSnapshot;
+    await new Store(env).putCache("score-export", "profile", { name: "Previous user", rating: 10 });
+    let fail = true;
+    vi.spyOn(Store.prototype, "writeSnapshot").mockImplementation(async function(snapshot, caches) {
+      if (fail && snapshot.imageStats.uploaded > 0) { fail = false;throw new Error("Temporary snapshot write failure"); }
+      return original.call(this, snapshot, caches);
+    });
+    const job = await enqueue(env, "sync");await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("queued");
+    const state = JSON.parse((await new Store(env).sql("SELECT state FROM jobs WHERE id=?", job.jobId).first<string>("state"))!);
+    expect(state.historyPending).toBe(false);expect(state.media.every((item: { done?: boolean }) => !item.done)).toBe(true);
+    expect(state.profilePending).toBe(true);
+    expect((await new Store(env).cache<{ name: string }>("score-export", ["profile"])).profile.name).toBe("Previous user");
+    await deliver(sent.shift()!);
+    const result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");expect(result.result?.snapshot?.potentialImageKey).toBeTruthy();
+    expect(result.result?.snapshot?.best50.every(score => score.imageKey)).toBe(true);
+    expect(client.getPotentialHistory).toHaveBeenCalledTimes(1);expect(client.getOnlineImage).toHaveBeenCalledTimes(1);expect(client.getChartImage).toHaveBeenCalledTimes(50);
+  });
+  it("starts exports alongside snapshot backup and settles both before retrying", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mockLowiro();
+    const original = Store.prototype.backup;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(Store.prototype, "backup").mockImplementation(async function(snapshot) { await gate;return original.call(this, snapshot); });
+    const exporting = vi.spyOn(Store.prototype, "exportArchive").mockRejectedValueOnce(new Error("Temporary export failure"));
+    const job = await enqueue(env, "sync"), running = deliver(sent.shift()!);
+    try {
+      await vi.waitFor(() => expect(exporting).toHaveBeenCalledTimes(1));
+      expect((await getJob(env, job.jobId)).status).toBe("running");
+    } finally { release(); }
+    await running;
+    expect((await getJob(env, job.jobId)).status).toBe("queued");
+    await deliver(sent.shift()!);
+    const result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");expect(result.result?.recorded).toBe(true);
+    expect(await env.ARCHIVE.head(`snapshots/${result.result!.snapshot!.id}.json`)).not.toBeNull();
+    expect(await env.ARCHIVE.head("exports/b50-history.json")).not.toBeNull();
+  });
+  it("recovers the last completed media group if its stage commit fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const store = new Store(env), previous = fixture();
+    previous.best50.forEach(score => { score.imageKey = `charts/${score.bg}.jpg`; });
+    previous.potentialImageKey = `potential/${previous.id}.image`;
+    await store.writeSnapshot(previous);
+    const remote = structuredClone(previous);
+    remote.best50.forEach(score => { delete score.imageKey; });
+    remote.best50[0].score++;
+    remote.best50[0].bg = "f".repeat(32);
+    const client = mockLowiro(remote), original = Store.prototype.sql;
+    let fail = true;
+    vi.spyOn(Store.prototype, "sql").mockImplementation(function(query, ...values) {
+      if (fail && query.includes("UPDATE jobs SET status=?,stage=") && values[1] === "archive") {
+        fail = false;
+        return this.env.DB.prepare("SELECT * FROM missing_stage_commit_fixture");
+      }
+      return original.call(this, query, ...values);
+    });
+    const job = await enqueue(env, "sync");
+    await deliver(sent.shift()!);
+    expect(await getJob(env, job.jobId)).toMatchObject({ status: "queued", stage: "media" });
+    await deliver(sent.shift()!);
+    const result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");
+    expect(result.result?.snapshot?.mediaStatus).toBe("complete");
+    expect(result.result?.snapshot?.best50[0]).toMatchObject({ score: remote.best50[0].score, imageKey: `charts/${"f".repeat(32)}.jpg` });
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(1);
+    expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
+    expect(client.getChartImage).toHaveBeenCalledExactlyOnceWith("f".repeat(32));
+    expect(await env.ARCHIVE.head(`snapshots/${result.result!.snapshot!.id}.json`)).not.toBeNull();
+  });
+  it("resumes a previously queued history stage without fetching B50 again", async () => {
+    const snapshot = fixture(), store = new Store(env), client = mockLowiro();
+    await store.writeSnapshot(snapshot);
+    const job = await enqueue(env, "sync");
+    await store.sql("UPDATE jobs SET stage='history',state=? WHERE id=?", JSON.stringify({ snapshotId: snapshot.id }), job.jobId).run();
+    await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+    expect(client.fetchB50Snapshot).not.toHaveBeenCalled();expect(client.getPotentialHistory).toHaveBeenCalledTimes(1);
+  });
+  it("resumes a legacy profile stage without fetching B50 again", async () => {
+    const snapshot = uncachedFixture(), store = new Store(env), client = mockLowiro(snapshot);
+    await store.writeSnapshot(snapshot);
+    const job = await enqueue(env, "sync");
+    await store.sql("UPDATE jobs SET stage='profile',state=? WHERE id=?", JSON.stringify({ snapshotId: snapshot.id, historyPending: true }), job.jobId).run();
+    await deliver(sent.shift()!);
+    expect(await getJob(env, job.jobId)).toMatchObject({ status: "succeeded", result: { snapshot: { user: { avatarImageKey: `characters/${snapshot.user.characterIcon}.png` } } } });
+    expect(client.fetchB50Snapshot).not.toHaveBeenCalled();
+    expect(client.getCharacterIconImage).toHaveBeenCalledOnce();
+  });
+  it("commits a pending profile even when all score media is already persisted", async () => {
+    const snapshot = uncachedFixture(), store = new Store(env), client = mockLowiro(snapshot);
+    snapshot.best50.forEach(score => { score.imageKey = `charts/${score.bg}.jpg`; });
+    snapshot.potentialImageKey = `potential/${snapshot.id}.image`;
+    snapshot.user.avatarImageKey = `characters/${snapshot.user.characterIcon}.png`;
+    await store.writeSnapshot(snapshot);
+    const job = await enqueue(env, "sync");
+    await store.sql("UPDATE jobs SET stage='media',state=? WHERE id=?", JSON.stringify({ snapshotId: snapshot.id, profilePending: true }), job.jobId).run();
+    await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+    expect((await store.cache<{ name: string }>("score-export", ["profile"])).profile.name).toBe("Test");
+    expect(client.fetchB50Snapshot).not.toHaveBeenCalled();expect(client.getChartImage).not.toHaveBeenCalled();expect(client.getOnlineImage).not.toHaveBeenCalled();
+  });
+  it("finishes an uncached B50 in one delivery and reuses one upstream session", async () => {
+    const client = mockLowiro(uncachedFixture());
+    const writes = vi.spyOn(Store.prototype, "writeSnapshot"), caches = vi.spyOn(Store.prototype, "cache");
+    const job = await enqueue(env, "sync"), message = sent.shift()!;
+    const delivered = await deliver(message), result = await getJob(env, job.jobId);
+    expect(result.status).toBe("succeeded");expect(delivered.ack).toHaveBeenCalledOnce();
+    expect(result.timings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "stage.fetch" }), expect.objectContaining({ name: "sync.profile" }),
+      expect.objectContaining({ name: "stage.media" }), expect.objectContaining({ name: "stage.archive" }),
+    ]));
+    expect(sent).toHaveLength(0);
+    expect(ArcaeaClient.login).toHaveBeenCalledTimes(1);
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(1);
+    expect(client.getBest50).not.toHaveBeenCalled();
+    expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
+    expect(client.getChartImage).toHaveBeenCalledTimes(50);
+    expect(client.getCharacterIconImage).toHaveBeenCalledTimes(1);
+    expect(writes.mock.calls.length).toBeLessThan(20);
+    for (const [kind, keys] of caches.mock.calls.filter(([kind]) => kind === "chart" || kind === "character")) {
+      expect(keys).toBeDefined();expect(keys!.length).toBe(kind === "chart" ? 50 : 1);
+    }
+    expect(result.result?.snapshot?.imageStats).toMatchObject({ requested: 50, uploaded: 50, cached: 0 });
+    expect(result.result?.snapshot?.user.avatarImageUrl).toBe(`/api/media/characters/${"c".repeat(32)}.png`);
+    expect(await env.ARCHIVE.head(`snapshots/${result.result!.snapshot!.id}.json`)).not.toBeNull();
+  });
+  it("yields within its time budget and resumes the durable step after an expired lease", async () => {
+    const client = mockLowiro(uncachedFixture()), now = Date.now;
+    let elapsed = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now() + elapsed);
+    client.getChartImage.mockImplementation(async () => { elapsed = 121_000;return { body: new Uint8Array([1]).buffer, contentType: "image/jpeg" }; });
+    const job = await enqueue(env, "sync"), original = sent.shift()!;
+    await deliver(original);
+    const yielded = await getJob(env, job.jobId);
+    expect(yielded.status).toBe("queued");expect(yielded.stage).toBe("media");
+    expect(yielded.progress.completed).toBeGreaterThan(0);expect(yielded.progress.completed).toBeLessThan(yielded.progress.total);
+    const step = await new Store(env).sql("SELECT step FROM jobs WHERE id=?", job.jobId).first<number>("step");
+    expect(sent[0].step).toBe(step);expect(step).toBeGreaterThan(original.step);
+    expect((await deliver(original)).ack).toHaveBeenCalledOnce();
+    await env.DB.prepare("UPDATE jobs SET status='running',lease_token='abandoned',lease_until=0,attempts=1 WHERE id=?").bind(job.jobId).run();
+    const row = await new Store(env).sql("SELECT state FROM jobs WHERE id=?", job.jobId).first<string>("state");
+    const saved = (await new Store(env).snapshot(JSON.parse(row!).snapshotId))!;
+    saved.user.name = "Updated between deliveries";
+    await new Store(env).writeSnapshot(saved);
+    sent.length = 0;elapsed = 0;
+    client.getChartImage.mockImplementation(async () => ({ body: new Uint8Array([1]).buffer, contentType: "image/jpeg" }));
+    await recover(env);expect(sent[0].step).toBe(step);
+    await deliver(sent.shift()!);
+    expect(await getJob(env, job.jobId)).toMatchObject({ status: "succeeded", result: { snapshot: { user: { name: "Updated between deliveries" } } } });
+    expect(ArcaeaClient.login).toHaveBeenCalledTimes(2);
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(1);
+    expect(client.getChartImage).toHaveBeenCalledTimes(50);expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
+  });
+  it("recovers uploaded media from R2 without logging in upstream", async () => {
+    const store = new Store(env), snapshot = fixture();
+    await store.writeSnapshot(snapshot);
+    await env.ARCHIVE.put(`potential/${snapshot.id}.image`, "potential");
+    await env.ARCHIVE.put(`charts/${snapshot.best50[0].bg}.jpg`, "chart");
+    const login = vi.spyOn(ArcaeaClient, "login").mockRejectedValue(new Error("Upstream must not be needed"));
+    const job = await enqueue(env, "retry", "manual", null, { snapshotId: snapshot.id });
+    await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");expect(login).not.toHaveBeenCalled();
+    expect((await store.latest())?.imageStats).toMatchObject({ cached: 1, uploaded: 0 });
+  });
+  it("keeps a fetched B50 when official history fails", async () => {
+    const client = mockLowiro();client.getPotentialHistory.mockRejectedValue(new Error("History temporarily unavailable"));
+    const job = await enqueue(env, "sync");await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+    expect(ArcaeaClient.login).toHaveBeenCalledTimes(1);
+    expect(await new Store(env).logs()).toEqual(expect.arrayContaining([expect.objectContaining({ action: "history-import-failed", level: "warning" })]));
+  });
+  it("recovers a failed continuation dispatch using a redelivered older message", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = mockLowiro();client.getChartImage.mockRejectedValueOnce(new Error("Temporary image failure"));
+    const job = await enqueue(env, "sync"), original = sent.shift()!;
+    (env.JOBS.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("Queue temporarily unavailable"));
+    const first = await deliver(original);
+    expect(first.retry).toHaveBeenCalledWith({ delaySeconds: 30 });
+    expect((await getJob(env, job.jobId)).status).toBe("queued");expect(sent).toHaveLength(0);
+    expect((await deliver(original)).ack).toHaveBeenCalledOnce();
+    expect(sent[0].step).toBeGreaterThan(original.step);
+    await deliver(sent.shift()!);
+    expect((await getJob(env, job.jobId)).status).toBe("succeeded");
+    expect(client.fetchB50Snapshot).toHaveBeenCalledTimes(1);expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
+  });
+  it("does not remove another lease owner's recovery outbox", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = mockLowiro(), job = await enqueue(env, "sync");
+    client.getPotentialHistory.mockImplementation(async () => {
+      await env.DB.prepare("UPDATE jobs SET lease_token='replacement' WHERE id=?").bind(job.jobId).run();
+      return [];
+    });
+    await deliver(sent.shift()!);
+    const row = await new Store(env).sql("SELECT status,stage,step,lease_token FROM jobs WHERE id=?", job.jobId).first<JobRow>();
+    expect(row).toMatchObject({ status: "running", lease_token: "replacement" });
+    expect(await new Store(env).sql("SELECT step FROM outbox WHERE job_id=?", job.jobId).first<number>("step")).toBe(row!.step);
+    expect(row!.stage).toBe("media");
+  });
+  it("returns a durable job before a slow queue send completes", async () => {
+    const cookie = await login();
+    const pending: Promise<unknown>[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(env.JOBS.send).mockImplementationOnce(async message => {
+      await gate;
+      sent.push(message as JobMessage);
+    });
+    const batch = vi.spyOn(env.DB, "batch");
+    try {
+      const response = await api(env, request("/api/sync", "POST", cookie), { waitUntil: promise => { pending.push(promise); } });
+      expect(response.status).toBe(202);
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(response.headers.get("server-timing")).toMatch(/d1.job.create;dur=/);
+      expect(response.headers.get("server-timing")).not.toMatch(/queue.send;|d1.outbox.sent;/);
+      const payload = await response.json() as { jobId: string; job: { id: string; status: string; stage: string } };
+      expect(payload.job).toMatchObject({ id: payload.jobId, status: "queued", stage: "fetch" });
+      expect((await getJob(env, payload.jobId)).status).toBe("queued");
+      const receipt = await env.DB.prepare("SELECT sent_at FROM outbox WHERE job_id=?").bind(payload.jobId).first();
+      expect(receipt).toEqual({ sent_at: null });
+      expect(pending).toHaveLength(1);
+      expect(sent).toHaveLength(0);
+      release();
+      await Promise.all(pending);
+      expect(sent).toEqual([{ jobId: payload.jobId, step: 0 }]);
+      expect(await env.DB.prepare("SELECT sent_at FROM outbox WHERE job_id=?").bind(payload.jobId).first<number>("sent_at")).toBeGreaterThan(0);
+    } finally {
+      release();
+      await Promise.allSettled(pending);
+    }
+  });
+  it("recovers a failed background queue send after responding to the browser", async () => {
+    const cookie = await login();
+    const pending: Promise<unknown>[] = [];
+    const failure = new Error("queue unavailable");
+    vi.mocked(env.JOBS.send).mockRejectedValueOnce(failure);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await api(env, request("/api/sync", "POST", cookie), { waitUntil: promise => { pending.push(promise); } });
+    const { jobId } = await response.json() as { jobId: string };
+    await Promise.all(pending);
+    expect(response.status).toBe(202);
+    expect((await getJob(env, jobId)).status).toBe("queued");
+    expect(sent).toHaveLength(0);
+    expect(log).toHaveBeenCalledWith("[outbox] deferred", failure);
+    await recover(env);
+    expect(sent).toEqual([{ jobId, step: 0 }]);
+  });
+  it("does not accept or dispatch a job when its transaction fails", async () => {
+    const cookie = await login();
+    const waitUntil = vi.fn();
+    vi.spyOn(env.DB, "batch").mockRejectedValueOnce(new Error("database unavailable"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await api(env, request("/api/sync", "POST", cookie), { waitUntil });
+    expect(response.status).toBe(500);
+    expect(waitUntil).not.toHaveBeenCalled();
+    expect(env.JOBS.send).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM jobs").first<number>("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM outbox").first<number>("count")).toBe(0);
+  });
+  it("atomically retries a failed job once without waiting for queue delivery", async () => {
+    const cookie = await login();
+    const initial = await enqueue(env, "sync");
+    sent.length = 0;
+    await env.DB.prepare("UPDATE jobs SET status='failed',stage='media',step=3,error='temporary failure' WHERE id=?").bind(initial.jobId).run();
+    const pending: Promise<unknown>[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(env.JOBS.send).mockImplementationOnce(async message => { await gate; sent.push(message as JobMessage); });
+    const background = { waitUntil: (promise: Promise<unknown>) => { pending.push(promise); } };
+    try {
+      const responses = await Promise.all([0, 1].map(() => api(env, request(`/api/jobs/${initial.jobId}/retry`, "POST", cookie), background)));
+      expect(responses.map(response => response.status).sort()).toEqual([202, 409]);
+      const accepted = responses.find(response => response.status === 202)!;
+      expect(await accepted.json()).toMatchObject({ jobId: initial.jobId, job: { status: "queued", stage: "media" } });
+      expect(pending).toHaveLength(1);
+      expect(sent).toHaveLength(0);
+      release();
+      await Promise.all(pending);
+      expect(sent).toEqual([{ jobId: initial.jobId, step: 4 }]);
+    } finally {
+      release();
+      await Promise.allSettled(pending);
+    }
+  });
   it("deduplicates concurrent submits and cron dates, ignores repeated deliveries",async()=>{
     const [a,b]=await Promise.all([enqueue(env,'sync'),enqueue(env,'sync')]);expect(a.jobId).toBe(b.jobId);
     const [c,d]=await Promise.all([enqueue(env,'sync','daily','daily:2026-10-14'),enqueue(env,'sync','daily','daily:2026-10-14')]);expect(c.jobId).toBe(d.jobId);
@@ -226,8 +1292,16 @@ describe("durable queue pipeline",()=>{
     const errorLog=vi.spyOn(console,'error').mockImplementation(()=>{});
     const client=mockLowiro();client.getChartImage.mockRejectedValue(failure);
     const job=await enqueue(env,'sync');
-    await deliver(sent.shift()!);await deliver(sent.shift()!);const media=sent.shift()!;
-    for(let i=0;i<4;i++)await deliver(media);
+    let media=sent.shift()!;
+    for(let i=0;i<4;i++){
+      await deliver(media);
+      if(sent.length){
+        const continuation=sent.shift()!;
+        expect(continuation.step).toBeGreaterThan(media.step);
+        expect((env.JOBS.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toEqual({delaySeconds:30});
+        media=continuation;
+      }
+    }
     expect(errorLog.mock.calls).toEqual(Array.from({length:4},()=>['[job] step failed',job.jobId,'media',failure]));
     errorLog.mockRestore();
     expect((await getJob(env,job.jobId)).status).toBe('failed');expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
@@ -237,5 +1311,36 @@ describe("durable queue pipeline",()=>{
     await retryJob(env,job.jobId);
     for(let i=0;i<20 && (await getJob(env,job.jobId)).status!=='succeeded';i++){const message=sent.shift();if(message)await deliver(message);}
     expect((await getJob(env,job.jobId)).status).toBe('succeeded');expect(client.getOnlineImage).toHaveBeenCalledTimes(1);
+  });
+  it("checks and caches the latest Arcaea version for the dashboard",async()=>{
+    expect((await api(env,request('/api/version'))).status).toBe(401);
+    const cookie=await login();
+    const fetchSpy=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(
+      Response.json({success:true,value:{version:'7.3.0c'}})
+    );
+    const first=await api(env,request('/api/version','GET',cookie));
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({constantsVersion:'7.3.0',latestVersion:'7.3.0c',upToDate:true,source:'lowiro-apk'});
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const cached=await api(env,request('/api/version','GET',cookie));
+    expect(cached.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const dashboard=await api(env,request('/api/dashboard','GET',cookie));
+    expect(dashboard.status).toBe(200);
+    expect(await dashboard.json()).toMatchObject({version:{constantsVersion:'7.3.0',latestVersion:'7.3.0c',upToDate:true}});
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    fetchSpy.mockResolvedValueOnce(Response.json({success:true,value:{version:'7.4.0c'}}));
+    const refreshed=await api(env,request('/api/version?refresh=1','GET',cookie));
+    expect(refreshed.status).toBe(200);
+    expect(await refreshed.json()).toMatchObject({constantsVersion:'7.3.0',latestVersion:'7.4.0c',upToDate:false});
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    fetchSpy.mockRejectedValueOnce(new Error('network error'));
+    const failed=await api(env,request('/api/version?refresh=1','GET',cookie));
+    expect(failed.status).toBe(502);
+    fetchSpy.mockRestore();
   });
 });
